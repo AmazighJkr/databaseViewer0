@@ -105,11 +105,13 @@ def handle_login(data):
 
 @socketio.on('login_response')
 def handle_login_response(data):
+    print(f"API: login_response received with data: {data}")
     client_sid = data.get('client_sid')
     success = data.get('success')
     error = data.get('error')
     user_info = data.get('user_info')
     if not client_sid:
+        print("API: No client_sid in login_response")
         return
     # Get store_code from pending_logins
     store_code = None
@@ -129,13 +131,14 @@ def handle_login_response(data):
             store_name = row[0] if row else ""
     except Exception as e:
         store_name = ""
+    print(f"API: Emitting login_result to client {client_sid}: success={success}, error={error}")
     socketio.emit('login_result', {
         'success': success,
         'error': error,
         'user_info': user_info,
         'store_name': store_name
     }, room=client_sid)
-    print(f"Relayed login result to client {client_sid}: {success}, {error}")
+    print(f"API: Relayed login result to client {client_sid}: {success}, {error}")
     # Remove from pending
     if client_sid in pending_logins:
         del pending_logins[client_sid]
