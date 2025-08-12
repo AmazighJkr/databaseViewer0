@@ -1,4 +1,3 @@
-import eventlet
 import pymysql
 from flask import Flask, jsonify, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
@@ -643,3 +642,4 @@ def handle_test_event(data):
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000) 
+
