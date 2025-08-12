@@ -1,6 +1,5 @@
 Flask
 Flask-SocketIO
-eventlet
 PyMySQL 
 gunicorn
 gevent
