@@ -1,7 +1,4 @@
 import eventlet
-
-eventlet.monkey_patch()
-
 import pymysql
 from flask import Flask, jsonify, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
@@ -21,14 +18,10 @@ pending_requests = {}  # client_sid: [ {'type': ..., ...}, ... ]
 # Add to session management
 pending_usernames = {}  # client_sid: store_code
 
-# --- DB connection helpers ---
-def get_db_connection(store_code=None):
-    # For store data, connect to the 'user' database (per store)
-    return pymysql.connect(host='localhost', user='root', password='', database='user')
-
+# --- DB connection helper ---
 def get_api_db_connection():
     # For API store authentication, connect to the 'stores' database
-    return pymysql.connect(host='localhost', user='root', password='', database='stores')
+    return pymysql.connect(host='db4free.net', user='vmmachine03', password='vmmachine03', database='vmmachine03')
 
 @app.route('/')
 def index():
