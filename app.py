@@ -4,7 +4,7 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins='*')
+socketio = SocketIO(app, async_mode='gevent', cors_allowed_origins='*')
 
 # Store active store and client sessions
 store_sessions = {}  # store_code: sid
@@ -642,4 +642,3 @@ def handle_test_event(data):
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000) 
-
