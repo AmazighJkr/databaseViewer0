@@ -1,5 +1,6 @@
 Flask
 Flask-SocketIO
+gevent-websocket
 PyMySQL 
 gunicorn
 gevent
