@@ -163,6 +163,42 @@ def handle_get_products(data):
     print(f'API: pending_requests after get_products: {pending_requests}')
     socketio.emit('get_products', data, room=store_sid)
 
+# --- BARCODE RELAY HANDLERS ---
+@socketio.on('get_product_by_barcode')
+def handle_get_product_by_barcode(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('product_by_barcode_data', {'success': False, 'error': 'Not registered for a store'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('product_by_barcode_data', {'success': False, 'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'barcode', 'store_code': store_code})
+    print(f'API: pending_requests after get_product_by_barcode: {pending_requests}')
+    socketio.emit('get_product_by_barcode', data, room=store_sid)
+
+@socketio.on('product_by_barcode_data')
+def handle_product_by_barcode_data(data):
+    print(f'API: product_by_barcode_data received, pending_requests={pending_requests}')
+    for client_sid, reqs in list(pending_requests.items()):
+        if not isinstance(reqs, list):
+            print(f"WARNING: pending_requests[{client_sid}] is not a list, skipping: {reqs}")
+            continue
+        for i, req in enumerate(reqs):
+            if req['type'] == 'barcode':
+                print(f'API: relaying product_by_barcode_data to client_sid={client_sid}')
+                socketio.emit('product_by_barcode_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
+
 @socketio.on('products_data')
 def handle_products_data(data):
     print(f'API: products_data received, pending_requests={pending_requests}')
