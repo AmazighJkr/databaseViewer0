@@ -193,6 +193,7 @@ def handle_product_by_barcode_data(data):
         for i, req in enumerate(reqs):
             if req['type'] == 'barcode':
                 print(f'API: relaying product_by_barcode_data to client_sid={client_sid}')
+                # Payload may contain only {'success': True, 'name': '...'} now
                 socketio.emit('product_by_barcode_data', data, room=client_sid)
                 del pending_requests[client_sid][i]
                 if not pending_requests[client_sid]:
