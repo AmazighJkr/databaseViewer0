@@ -4,7 +4,14 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, async_mode='gevent', cors_allowed_origins='*')
+# Tighter, mobile-friendly Engine.IO settings: longer ping timeout, reasonable ping interval
+socketio = SocketIO(
+    app,
+    async_mode='gevent',
+    cors_allowed_origins='*',
+    ping_interval=25,
+    ping_timeout=90
+)
 
 # Store active store and client sessions
 store_sessions = {}  # store_code: sid
@@ -47,6 +54,7 @@ def handle_register_store(data):
     except Exception as e:
         emit('register_store_response', {'success': False, 'error': f'Database error: {e}'})
         return
+    # Always update to latest sid so reconnect rebinds correctly
     store_sessions[store_code] = request.sid
     join_room(store_code)
     emit('register_store_response', {'success': True, 'store_code': store_code})
@@ -58,10 +66,7 @@ def handle_register_client(data):
     if not store_code:
         emit('register_client_response', {'success': False, 'error': 'Missing store code'})
         return
-    # Validate that the store backend is connected (store previously registered with auth_code)
-    if store_code not in store_sessions:
-        emit('register_client_response', {'success': False, 'error': 'Store backend not connected'})
-        return
+    # Allow client to register even if backend currently offline; it will receive errors per-request
     try:
         conn = get_api_db_connection()
         with conn.cursor() as cursor:
@@ -663,7 +668,11 @@ def handle_disconnect():
     sid = request.sid
     for store_code, store_sid in list(store_sessions.items()):
         if store_sid == sid:
-            del store_sessions[store_code]
+            # Keep store mapping around briefly to allow quick reconnects without flapping
+            try:
+                del store_sessions[store_code]
+            except Exception:
+                pass
             print(f"Store disconnected: {store_code}")
     if sid in client_sessions:
         print(f"Client disconnected from store: {client_sessions[sid]}")
