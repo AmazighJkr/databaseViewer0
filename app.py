@@ -21,8 +21,7 @@ pending_logins = {}  # client_sid: (store_code, username, password)
 # Change pending_requests to allow multiple requests per client
 # pending_requests: {client_sid: [request_dict, ...]}
 pending_requests = {}  # client_sid: [ {'type': ..., ...}, ... ]
-# Add to session management
-pending_usernames = {}  # client_sid: store_code
+
 
 # --- DB connection helper ---
 def get_api_db_connection():
@@ -442,29 +441,25 @@ def handle_get_usernames(data):
     if store_code not in store_sessions:
         emit('usernames_list', {'usernames': [], 'error': 'Store backend not connected'})
         return
-    # Relay to Windows backend
+    # Relay to Windows backend - let it handle the response directly
     store_sid = store_sessions.get(store_code)
     if not store_sid:
         emit('usernames_list', {'usernames': [], 'error': 'Store backend not connected'})
         return
-    pending_usernames[client_sid] = store_code
-    # Always include client_sid so the Windows backend can echo it back
+    
+    # Send request to backend - backend will respond directly to client
     socketio.emit('get_usernames_request', {'client_sid': client_sid}, room=store_sid)
-    print(f"Relayed get_usernames for store {store_code} from client {client_sid} to backend.")
+    print(f"[API] Relayed get_usernames_request to backend for store {store_code}, client {client_sid}")
+    print(f"[API] Backend will respond directly to client {client_sid}")
 
-@socketio.on('usernames_list_response')
-def handle_usernames_list_response(data):
-    client_sid = data.get('client_sid')
-    usernames = data.get('usernames', [])
-    users = data.get('users', [])
-    error = data.get('error')
-    if not client_sid:
-        return
-    # Relay both the usernames list and full profiles if provided
-    socketio.emit('usernames_list', {'usernames': usernames, 'users': users, 'error': error}, room=client_sid)
-    if client_sid in pending_usernames:
-        del pending_usernames[client_sid]
-    print(f"Relayed usernames_list to client {client_sid} (usernames: {len(usernames)}, users: {len(users)})")
+# Remove the old relay handler since backend now sends directly
+# @socketio.on('usernames_list_response')
+# def handle_usernames_list_response(data):
+#     # This is no longer needed - backend sends directly to client
+#     pass
+
+# Handle direct usernames_list from backend (new approach)
+# This is no longer needed since backend communicates directly
 
 @socketio.on('get_treasury')
 def handle_get_treasury(data):
