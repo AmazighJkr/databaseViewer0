@@ -448,6 +448,7 @@ def handle_get_usernames(data):
         emit('usernames_list', {'usernames': [], 'error': 'Store backend not connected'})
         return
     pending_usernames[client_sid] = store_code
+    # Always include client_sid so the Windows backend can echo it back
     socketio.emit('get_usernames_request', {'client_sid': client_sid}, room=store_sid)
     print(f"Relayed get_usernames for store {store_code} from client {client_sid} to backend.")
 
@@ -672,9 +673,9 @@ def handle_disconnect():
         if store_sid == sid:
             # Keep store mapping around briefly to allow quick reconnects without flapping
             try:
-            del store_sessions[store_code]
-            except Exception:
-                pass
+                del store_sessions[store_code]
+            except Exception as e:
+                print(f"Error removing store session for {store_code}: {e}")
             print(f"Store disconnected: {store_code}")
     if sid in client_sessions:
         print(f"Client disconnected from store: {client_sessions[sid]}")
