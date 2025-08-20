@@ -452,14 +452,49 @@ def handle_get_usernames(data):
     print(f"[API] Relayed get_usernames_request to backend for store {store_code}, client {client_sid}")
     print(f"[API] Backend will respond directly to client {client_sid}")
 
-# Remove the old relay handler since backend now sends directly
-# @socketio.on('usernames_list_response')
-# def handle_usernames_list_response(data):
-#     # This is no longer needed - backend sends directly to client
-#     pass
+@socketio.on('usernames_list_response')
+def handle_usernames_list_response(data):
+    client_sid = data.get('client_sid')
+    usernames = data.get('usernames', [])
+    users = data.get('users', [])
+    error = data.get('error')
+    
+    if not client_sid:
+        print(f"[API] usernames_list_response missing client_sid, data: {data}")
+        return
+    
+    if error:
+        print(f"[API] Backend error for client {client_sid}: {error}")
+        # Still relay the error to client
+        socketio.emit('usernames_list', {'usernames': [], 'users': [], 'error': error}, room=client_sid)
+        return
+    
+    # Validate data structure
+    if not isinstance(usernames, list):
+        print(f"[API] Invalid usernames format for client {client_sid}: {type(usernames)}")
+        usernames = []
+    
+    if not isinstance(users, list):
+        print(f"[API] Invalid users format for client {client_sid}: {type(users)}")
+        users = []
+    
+    # Relay both the usernames list and full profiles if provided
+    response_data = {'usernames': usernames, 'users': users, 'error': error}
+    socketio.emit('usernames_list', response_data, room=client_sid)
+    
+    print(f"[API] Relayed usernames_list to client {client_sid} (usernames: {len(usernames)}, users: {len(users)})")
+    if usernames:
+        print(f"[API] Sample usernames: {usernames[:3]}")
+    if users:
+        print(f"[API] Sample user profiles: {[u.get('np', 'Unknown') for u in users[:3]]}")
+        # Debug: Show actual user data being sent
+        if users:
+            print(f"[API] First user profile data: {users[0]}")
+            if len(users) > 1:
+                print(f"[API] Second user profile data: {users[1]}")
+        print(f"[API] Complete response data: {response_data}")
 
-# Handle direct usernames_list from backend (new approach)
-# This is no longer needed since backend communicates directly
+# Backend now sends usernames_list_response which we relay as usernames_list
 
 @socketio.on('get_treasury')
 def handle_get_treasury(data):
