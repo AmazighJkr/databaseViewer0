@@ -455,13 +455,15 @@ def handle_get_usernames(data):
 def handle_usernames_list_response(data):
     client_sid = data.get('client_sid')
     usernames = data.get('usernames', [])
+    users = data.get('users', [])
     error = data.get('error')
     if not client_sid:
         return
-    socketio.emit('usernames_list', {'usernames': usernames, 'error': error}, room=client_sid)
+    # Relay both the usernames list and full profiles if provided
+    socketio.emit('usernames_list', {'usernames': usernames, 'users': users, 'error': error}, room=client_sid)
     if client_sid in pending_usernames:
         del pending_usernames[client_sid]
-    print(f"Relayed usernames_list to client {client_sid} (count: {len(usernames)})")
+    print(f"Relayed usernames_list to client {client_sid} (usernames: {len(usernames)}, users: {len(users)})")
 
 @socketio.on('get_treasury')
 def handle_get_treasury(data):
@@ -670,7 +672,7 @@ def handle_disconnect():
         if store_sid == sid:
             # Keep store mapping around briefly to allow quick reconnects without flapping
             try:
-                del store_sessions[store_code]
+            del store_sessions[store_code]
             except Exception:
                 pass
             print(f"Store disconnected: {store_code}")
