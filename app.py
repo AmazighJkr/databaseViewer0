@@ -21,6 +21,49 @@ pending_logins = {}  # client_sid: (store_code, username, password)
 # Change pending_requests to allow multiple requests per client
 # pending_requests: {client_sid: [request_dict, ...]}
 pending_requests = {}  # client_sid: [ {'type': ..., ...}, ... ]
+# --- OFFLINE SNAPSHOT RELAY ---
+@socketio.on('get_snapshot_table')
+def handle_get_snapshot_table(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    table = (data or {}).get('table')
+    if not store_code or not table:
+        emit('snapshot_table_data', {'error': 'Missing store or table', 'table': table or ''})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('snapshot_table_data', {'error': 'Store backend not connected', 'table': table})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'snapshot', 'store_code': store_code, 'table': table})
+    payload = {
+        'client_sid': client_sid,
+        'table': table,
+        'offset': int((data or {}).get('offset', 0)),
+        'limit': int((data or {}).get('limit', 1000)),
+    }
+    socketio.emit('get_snapshot_table', payload, room=store_sid)
+
+@socketio.on('snapshot_table_data')
+def handle_snapshot_table_data(data):
+    table = (data or {}).get('table')
+    client_sid = (data or {}).get('client_sid')
+    if not client_sid:
+        # Fallback: deliver to first snapshot requester
+        for csid, reqs in list(pending_requests.items()):
+            for i, req in enumerate(reqs):
+                if req.get('type') == 'snapshot' and req.get('table') == table:
+                    socketio.emit('snapshot_table_data', data, room=csid)
+                    del pending_requests[csid][i]
+                    if not pending_requests[csid]:
+                        del pending_requests[csid]
+                    return
+        return
+    # Route directly to requesting client
+    socketio.emit('snapshot_table_data', data, room=client_sid)
 
 
 # --- DB connection helper ---
