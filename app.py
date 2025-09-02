@@ -101,6 +101,8 @@ def handle_register_store(data):
     join_room(store_code)
     emit('register_store_response', {'success': True, 'store_code': store_code})
     print(f"Store registered: {store_code}, sid: {request.sid}")
+    # Notify all clients bound to this store that backend is online
+    socketio.emit('store_online', {'store_code': store_code}, room=store_code)
 
 @socketio.on('register_client')
 def handle_register_client(data):
@@ -124,6 +126,9 @@ def handle_register_client(data):
     join_room(store_code)
     emit('register_client_response', {'success': True, 'store_code': store_code, 'store_name': store_name})
     print(f"Client registered for store: {store_code}, sid: {request.sid}")
+    # Immediately inform client about backend availability
+    if store_code not in store_sessions:
+        socketio.emit('store_offline', {'store_code': store_code}, room=request.sid)
 
 # --- Secure login relay ---
 @socketio.on('login')
