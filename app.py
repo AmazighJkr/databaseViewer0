@@ -11,8 +11,8 @@ socketio = SocketIO(
     app,
     async_mode='gevent',
     cors_allowed_origins='*',
-    ping_interval=5,
-    ping_timeout=15
+    ping_interval=4,
+    ping_timeout=10
 )
 
 # Store active store and client sessions
