@@ -2,6 +2,7 @@ import pymysql
 from flask import Flask, jsonify, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import gevent
+import time
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
@@ -119,8 +120,8 @@ def handle_register_store(data):
     # Always update to latest sid so reconnect rebinds correctly
     store_sessions[store_code] = request.sid
     join_room(store_code)
-    # Initialize activity tracking
-    update_store_activity(store_code)
+    # Initialize activity tracking (use current time)
+    store_last_activity[store_code] = time.time()
     # Update store status to ONLINE in database
     try:
         conn = get_api_db_connection()
@@ -835,27 +836,33 @@ store_last_activity = {}  # store_code: timestamp
 def update_store_activity(store_code):
     """Update last activity timestamp for a store"""
     if store_code:
-        store_last_activity[store_code] = gevent.hub.get_hub().loop.now()
+        store_last_activity[store_code] = time.time()
 
 def check_store_connections():
     """Periodically check if store sessions are still alive and update database status"""
     while True:
-        gevent.sleep(30)  # Check every 30 seconds
+        gevent.sleep(2)  # Check every 2 seconds for very fast detection
         try:
-            current_time = gevent.hub.get_hub().loop.now()
+            current_time = time.time()
             stores_to_check = list(store_sessions.keys())
             
             for store_code in stores_to_check:
                 store_sid = store_sessions.get(store_code)
                 if store_sid:
-                    # Check if we've received any activity recently (within last 2 minutes)
-                    # SocketIO ping_interval is 25s, ping_timeout is 90s, so 2 minutes gives us buffer
+                    # Check if we've received any activity recently
+                    # Fast detection: 5 seconds timeout for immediate response
                     last_activity = store_last_activity.get(store_code, 0)
+                    if last_activity == 0:
+                        # Store just registered, initialize with current time
+                        store_last_activity[store_code] = current_time
+                        continue
+                    
                     time_since_activity = current_time - last_activity
                     
-                    # If no activity in last 2 minutes (120 seconds), consider connection dead
-                    # This covers cases where backend is killed and disconnect event doesn't fire
-                    if time_since_activity > 120:
+                    # If no activity in last 5 seconds, consider connection dead
+                    # This ensures very fast detection when backend is killed
+                    # 5 seconds is fast enough to detect dead connections immediately
+                    if time_since_activity > 5:
                         print(f"Store {store_code} has no activity in {time_since_activity} seconds, marking as offline")
                         # Remove from sessions
                         if store_code in store_sessions:
