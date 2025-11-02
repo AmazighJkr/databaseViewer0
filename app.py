@@ -120,8 +120,8 @@ def handle_register_store(data):
     # Always update to latest sid so reconnect rebinds correctly
     store_sessions[store_code] = request.sid
     join_room(store_code)
-    # Initialize activity tracking (use current time)
-    store_last_activity[store_code] = time.time()
+    # Initialize activity tracking (use current time) - heartbeats will keep this updated
+    update_store_activity(store_code)
     # Update store status to ONLINE in database
     try:
         conn = get_api_db_connection()
@@ -792,17 +792,15 @@ def handle_facture_vente_details_data(data):
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    # Remove from sessions
+    # INSTANT detection of disconnect - Socket.IO tells us immediately when connection is lost
     sid = request.sid
     for store_code, store_sid in list(store_sessions.items()):
         if store_sid == sid:
-            # Keep store mapping around briefly to allow quick reconnects without flapping
             try:
                 del store_sessions[store_code]
-                # Remove activity tracking
                 if store_code in store_last_activity:
                     del store_last_activity[store_code]
-                # Update store status to OFFLINE in database
+                # INSTANT update to OFFLINE - no timeout needed
                 try:
                     conn = get_api_db_connection()
                     with conn.cursor() as cursor:
@@ -810,11 +808,11 @@ def handle_disconnect():
                         cursor.execute(sql, (store_code,))
                         conn.commit()
                     conn.close()
+                    print(f"Store {store_code} disconnected - status set to OFFLINE instantly")
                 except Exception as e:
                     print(f"Error updating store status to OFFLINE: {e}")
             except Exception as e:
                 print(f"Error removing store session for {store_code}: {e}")
-            print(f"Store disconnected: {store_code}")
     if sid in client_sessions:
         print(f"Client disconnected from store: {client_sessions[sid]}")
         del client_sessions[sid]
@@ -846,69 +844,43 @@ store_last_activity = {}  # store_code: timestamp
 def update_store_activity(store_code):
     """Update last activity timestamp for a store"""
     if store_code:
-        old_time = store_last_activity.get(store_code, 0)
-        new_time = time.time()
-        store_last_activity[store_code] = new_time
-        if old_time > 0:
-            elapsed = new_time - old_time
-            if elapsed > 60:  # Only log if it's been a while (to reduce log spam)
-                print(f"[ACTIVITY] Updated activity for {store_code} (was {elapsed:.1f}s since last update)")
+        store_last_activity[store_code] = time.time()
 
 def check_store_connections():
     """Periodically check if store sessions are still alive and update database status"""
     while True:
-        gevent.sleep(10)  # Check every 10 seconds (less frequent since we check connection state)
+        gevent.sleep(30)  # Check every 30 seconds - rely on disconnect event for instant detection
         try:
             current_time = time.time()
             stores_to_check = list(store_sessions.keys())
             
             for store_code in stores_to_check:
                 store_sid = store_sessions.get(store_code)
-                if store_sid:
-                    try:
-                        # Check if the socket session exists in Socket.IO
-                        namespace = socketio.server.namespace_handlers.get('/')
-                        if namespace:
-                            # Try to get the socket - if it doesn't exist, connection is dead
-                            socket_exists = False
-                            try:
-                                
-                                socket_exists = True  # Assume exists for now, check timeout instead
-                            except:
-                                socket_exists = False
-                    except Exception as e:
-                        print(f"Error checking socket state for {store_code}: {e}")
-                        socket_exists = False
-                    
-                    # Check activity timeout as fallback
-                    # ping_interval=25s, ping_timeout=90s
-                    # Use timeout of 120 seconds (ping_interval + ping_timeout + buffer)
-                    # This ensures we don't mark idle but connected stores as offline
-                    last_activity = store_last_activity.get(store_code, 0)
-                    if last_activity == 0:
-                        # Store just registered, initialize with current time
-                        store_last_activity[store_code] = current_time
-                        continue
-                    
-                    time_since_activity = current_time - last_activity
-                    
-                    # Use 120 seconds timeout (2 minutes) to allow for:
-                    # - Heartbeat every 5 seconds (so ~24 heartbeats per timeout period)
-                    # - Network delays, packet loss, temporary issues
-                    # - Socket.IO reconnection delays
-                    # This ensures we don't mark alive backends as offline due to temporary network hiccups
-                    if time_since_activity > 120:
-                        print(f"Store {store_code} has no activity in {time_since_activity:.1f} seconds (timeout=120s), marking as offline")
-                        print(f"  Last activity was at: {time.time() - last_activity:.1f} seconds ago")
-                        print(f"  Current time: {current_time}")
-                        print(f"  Store sessions: {list(store_sessions.keys())}")
-                        print(f"  Store activity times: {store_last_activity}")
-                        # Remove from sessions
+                if not store_sid:
+                    continue
+                
+                # Use activity timeout ONLY as backup - Socket.IO disconnect event handles instant detection
+                # Only check if no activity for a very long time (3 minutes) to catch truly dead connections
+                # that somehow didn't trigger disconnect event
+                last_activity = store_last_activity.get(store_code, 0)
+                if last_activity == 0:
+                    # Store just registered, initialize with current time
+                    store_last_activity[store_code] = current_time
+                    continue
+                
+                time_since_activity = current_time - last_activity
+                
+                # 180 seconds (3 minutes) - very conservative, only catches truly dead connections
+                # Socket.IO's disconnect event should handle normal disconnects instantly
+                # This is just a safety net for edge cases where disconnect event might be missed
+                if time_since_activity > 180:
+                    # Double-check: only mark offline if store_sid still exists (session might have been cleaned up)
+                    if store_code in store_sessions and store_sessions[store_code] == store_sid:
+                        print(f"Store {store_code} has no activity in {time_since_activity:.1f} seconds, marking as offline (safety net)")
                         if store_code in store_sessions:
                             del store_sessions[store_code]
                         if store_code in store_last_activity:
                             del store_last_activity[store_code]
-                        # Update database status to OFFLINE
                         try:
                             conn = get_api_db_connection()
                             with conn.cursor() as cursor:
@@ -916,7 +888,6 @@ def check_store_connections():
                                 cursor.execute(sql, (store_code,))
                                 conn.commit()
                             conn.close()
-                            print(f"Updated store {store_code} status to OFFLINE (timeout)")
                         except Exception as db_error:
                             print(f"Error updating store status to OFFLINE: {db_error}")
         except Exception as e:
