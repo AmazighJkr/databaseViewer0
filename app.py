@@ -75,6 +75,25 @@ def get_api_db_connection():
 def index():
     return jsonify({'message': 'API is running'})
 
+@app.route('/api/store_status/<store_code>')
+def get_store_status(store_code):
+    """REST endpoint to check store status (ONLINE or OFFLINE)"""
+    try:
+        conn = get_api_db_connection()
+        with conn.cursor() as cursor:
+            # Check if store exists and get its status
+            sql = "SELECT status FROM stores WHERE store_code=%s LIMIT 1"
+            cursor.execute(sql, (store_code,))
+            row = cursor.fetchone()
+        conn.close()
+        if row:
+            status = row[0] if row[0] else 'OFFLINE'  # Default to OFFLINE if NULL
+            return jsonify({'store_code': store_code, 'status': status})
+        else:
+            return jsonify({'store_code': store_code, 'status': 'OFFLINE', 'error': 'Store not found'}), 404
+    except Exception as e:
+        return jsonify({'store_code': store_code, 'status': 'OFFLINE', 'error': str(e)}), 500
+
 @socketio.on('register_store')
 def handle_register_store(data):
     store_code = data.get('store_code')
@@ -99,6 +118,16 @@ def handle_register_store(data):
     # Always update to latest sid so reconnect rebinds correctly
     store_sessions[store_code] = request.sid
     join_room(store_code)
+    # Update store status to ONLINE in database
+    try:
+        conn = get_api_db_connection()
+        with conn.cursor() as cursor:
+            sql = "UPDATE stores SET status='ONLINE' WHERE store_code=%s"
+            cursor.execute(sql, (store_code,))
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error updating store status to ONLINE: {e}")
     emit('register_store_response', {'success': True, 'store_code': store_code})
     print(f"Store registered: {store_code}, sid: {request.sid}")
     # Notify all clients bound to this store that backend is online
@@ -742,6 +771,16 @@ def handle_disconnect():
             # Keep store mapping around briefly to allow quick reconnects without flapping
             try:
                 del store_sessions[store_code]
+                # Update store status to OFFLINE in database
+                try:
+                    conn = get_api_db_connection()
+                    with conn.cursor() as cursor:
+                        sql = "UPDATE stores SET status='OFFLINE' WHERE store_code=%s"
+                        cursor.execute(sql, (store_code,))
+                        conn.commit()
+                    conn.close()
+                except Exception as e:
+                    print(f"Error updating store status to OFFLINE: {e}")
             except Exception as e:
                 print(f"Error removing store session for {store_code}: {e}")
             print(f"Store disconnected: {store_code}")
