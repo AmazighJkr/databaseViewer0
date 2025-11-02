@@ -833,22 +833,12 @@ def handle_test_event(data):
 @socketio.on('heartbeat')
 def handle_heartbeat(data):
     """Handle heartbeat from backend to update activity tracking"""
-    # First try to get store_code from data
-    store_code = data.get('store_code') if data else None
-    
-    # If not in data, find it from session ID (like other handlers do)
-    if not store_code:
-        sid = request.sid
-        for code, store_sid in store_sessions.items():
-            if store_sid == sid:
-                store_code = code
-                break
-    
-    if store_code:
-        update_store_activity(store_code)
-        print(f"[HEARTBEAT] Received heartbeat from store {store_code}, updated activity")
-    else:
-        print(f"[HEARTBEAT] WARNING: Received heartbeat but could not identify store (sid={request.sid})")
+    # Use exact same pattern as other handlers that work (products_data, login_response, etc.)
+    sid = request.sid
+    for store_code, store_sid in store_sessions.items():
+        if store_sid == sid:
+            update_store_activity(store_code)
+            break
 
 # Track last activity time for each store (any event from backend)
 store_last_activity = {}  # store_code: timestamp
@@ -902,12 +892,13 @@ def check_store_connections():
                     
                     time_since_activity = current_time - last_activity
                     
-                    # Use 90 seconds timeout to account for:
-                    # - Heartbeat every 5 seconds (so ~18 heartbeats per timeout period)
-                    # - Network delays and temporary issues
-                    # - Allows for multiple missed heartbeats while still detecting dead backends quickly
-                    if time_since_activity > 90:
-                        print(f"Store {store_code} has no activity in {time_since_activity:.1f} seconds (timeout=90s), marking as offline")
+                    # Use 120 seconds timeout (2 minutes) to allow for:
+                    # - Heartbeat every 5 seconds (so ~24 heartbeats per timeout period)
+                    # - Network delays, packet loss, temporary issues
+                    # - Socket.IO reconnection delays
+                    # This ensures we don't mark alive backends as offline due to temporary network hiccups
+                    if time_since_activity > 120:
+                        print(f"Store {store_code} has no activity in {time_since_activity:.1f} seconds (timeout=120s), marking as offline")
                         print(f"  Last activity was at: {time.time() - last_activity:.1f} seconds ago")
                         print(f"  Current time: {current_time}")
                         print(f"  Store sessions: {list(store_sessions.keys())}")
