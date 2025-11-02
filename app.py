@@ -1,6 +1,7 @@
 import pymysql
 from flask import Flask, jsonify, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
+import gevent
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
@@ -118,6 +119,8 @@ def handle_register_store(data):
     # Always update to latest sid so reconnect rebinds correctly
     store_sessions[store_code] = request.sid
     join_room(store_code)
+    # Initialize activity tracking
+    update_store_activity(store_code)
     # Update store status to ONLINE in database
     try:
         conn = get_api_db_connection()
@@ -187,6 +190,12 @@ def handle_login(data):
 @socketio.on('login_response')
 def handle_login_response(data):
     print(f"API: login_response received with data: {data}")
+    # Update activity for the store that sent this response
+    sid = request.sid
+    for store_code, store_sid in store_sessions.items():
+        if store_sid == sid:
+            update_store_activity(store_code)
+            break
     client_sid = data.get('client_sid')
     success = data.get('success')
     error = data.get('error')
@@ -283,6 +292,12 @@ def handle_product_by_barcode_data(data):
 
 @socketio.on('products_data')
 def handle_products_data(data):
+    # Update activity for the store that sent this response
+    sid = request.sid
+    for store_code, store_sid in store_sessions.items():
+        if store_sid == sid:
+            update_store_activity(store_code)
+            break
     print(f'API: products_data received, pending_requests={pending_requests}')
     for client_sid, reqs in list(pending_requests.items()):
         if not isinstance(reqs, list):
@@ -319,6 +334,12 @@ def handle_get_product_details(data):
 
 @socketio.on('product_details_data')
 def handle_product_details_data(data):
+    # Update activity for the store that sent this response
+    sid = request.sid
+    for store_code, store_sid in store_sessions.items():
+        if store_sid == sid:
+            update_store_activity(store_code)
+            break
     print(f'API: product_details_data received, pending_requests={pending_requests}')
     for client_sid, reqs in list(pending_requests.items()):
         if not isinstance(reqs, list):
@@ -531,6 +552,12 @@ def handle_get_usernames(data):
 
 @socketio.on('usernames_list_response')
 def handle_usernames_list_response(data):
+    # Update activity for the store that sent this response
+    sid = request.sid
+    for store_code, store_sid in store_sessions.items():
+        if store_sid == sid:
+            update_store_activity(store_code)
+            break
     client_sid = data.get('client_sid')
     users = data.get('users', [])
     error = data.get('error')
@@ -771,6 +798,9 @@ def handle_disconnect():
             # Keep store mapping around briefly to allow quick reconnects without flapping
             try:
                 del store_sessions[store_code]
+                # Remove activity tracking
+                if store_code in store_last_activity:
+                    del store_last_activity[store_code]
                 # Update store status to OFFLINE in database
                 try:
                     conn = get_api_db_connection()
@@ -798,6 +828,56 @@ def handle_disconnect():
 def handle_test_event(data):
     print('Received test_event:', data)
     emit('test_response', {'message': 'Test event received', 'data': data})
+
+# Track last activity time for each store (any event from backend)
+store_last_activity = {}  # store_code: timestamp
+
+def update_store_activity(store_code):
+    """Update last activity timestamp for a store"""
+    if store_code:
+        store_last_activity[store_code] = gevent.hub.get_hub().loop.now()
+
+def check_store_connections():
+    """Periodically check if store sessions are still alive and update database status"""
+    while True:
+        gevent.sleep(30)  # Check every 30 seconds
+        try:
+            current_time = gevent.hub.get_hub().loop.now()
+            stores_to_check = list(store_sessions.keys())
+            
+            for store_code in stores_to_check:
+                store_sid = store_sessions.get(store_code)
+                if store_sid:
+                    # Check if we've received any activity recently (within last 2 minutes)
+                    # SocketIO ping_interval is 25s, ping_timeout is 90s, so 2 minutes gives us buffer
+                    last_activity = store_last_activity.get(store_code, 0)
+                    time_since_activity = current_time - last_activity
+                    
+                    # If no activity in last 2 minutes (120 seconds), consider connection dead
+                    # This covers cases where backend is killed and disconnect event doesn't fire
+                    if time_since_activity > 120:
+                        print(f"Store {store_code} has no activity in {time_since_activity} seconds, marking as offline")
+                        # Remove from sessions
+                        if store_code in store_sessions:
+                            del store_sessions[store_code]
+                        if store_code in store_last_activity:
+                            del store_last_activity[store_code]
+                        # Update database status to OFFLINE
+                        try:
+                            conn = get_api_db_connection()
+                            with conn.cursor() as cursor:
+                                sql = "UPDATE stores SET status='OFFLINE' WHERE store_code=%s"
+                                cursor.execute(sql, (store_code,))
+                                conn.commit()
+                            conn.close()
+                            print(f"Updated store {store_code} status to OFFLINE (no heartbeat)")
+                        except Exception as db_error:
+                            print(f"Error updating store status to OFFLINE: {db_error}")
+        except Exception as e:
+            print(f"Error in store connection check: {e}")
+
+# Start background task to check store connections
+gevent.spawn(check_store_connections)
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000) 
