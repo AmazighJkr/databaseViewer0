@@ -191,12 +191,7 @@ def handle_login(data):
 @socketio.on('login_response')
 def handle_login_response(data):
     print(f"API: login_response received with data: {data}")
-    # Update activity for the store that sent this response
-    sid = request.sid
-    for store_code, store_sid in store_sessions.items():
-        if store_sid == sid:
-            update_store_activity(store_code)
-            break
+    update_activity_for_session()
     client_sid = data.get('client_sid')
     success = data.get('success')
     error = data.get('error')
@@ -276,6 +271,7 @@ def handle_get_product_by_barcode(data):
 
 @socketio.on('product_by_barcode_data')
 def handle_product_by_barcode_data(data):
+    update_activity_for_session()
     print(f'API: product_by_barcode_data received, pending_requests={pending_requests}')
     for client_sid, reqs in list(pending_requests.items()):
         if not isinstance(reqs, list):
@@ -293,12 +289,7 @@ def handle_product_by_barcode_data(data):
 
 @socketio.on('products_data')
 def handle_products_data(data):
-    # Update activity for the store that sent this response
-    sid = request.sid
-    for store_code, store_sid in store_sessions.items():
-        if store_sid == sid:
-            update_store_activity(store_code)
-            break
+    update_activity_for_session()
     print(f'API: products_data received, pending_requests={pending_requests}')
     for client_sid, reqs in list(pending_requests.items()):
         if not isinstance(reqs, list):
@@ -335,12 +326,7 @@ def handle_get_product_details(data):
 
 @socketio.on('product_details_data')
 def handle_product_details_data(data):
-    # Update activity for the store that sent this response
-    sid = request.sid
-    for store_code, store_sid in store_sessions.items():
-        if store_sid == sid:
-            update_store_activity(store_code)
-            break
+    update_activity_for_session()
     print(f'API: product_details_data received, pending_requests={pending_requests}')
     for client_sid, reqs in list(pending_requests.items()):
         if not isinstance(reqs, list):
@@ -376,6 +362,7 @@ def handle_get_clients(data):
 
 @socketio.on('clients_data')
 def handle_clients_data(data):
+    update_activity_for_session()
     print(f'API: clients_data received, pending_requests={pending_requests}')
     for client_sid, reqs in list(pending_requests.items()):
         if not isinstance(reqs, list):
@@ -411,6 +398,7 @@ def handle_get_sales(data):
 
 @socketio.on('sales_data')
 def handle_sales_data(data):
+    update_activity_for_session()
     print(f'API: sales_data received, pending_requests={pending_requests}')
     for client_sid, reqs in list(pending_requests.items()):
         if not isinstance(reqs, list):
@@ -447,6 +435,7 @@ def handle_get_sale_details(data):
 
 @socketio.on('sale_details_data')
 def handle_sale_details_data(data):
+    update_activity_for_session()
     print(f'API: sale_details_data received, pending_requests={pending_requests}')
     for client_sid, reqs in list(pending_requests.items()):
         if not isinstance(reqs, list):
@@ -483,6 +472,7 @@ def handle_get_vendeurs(data):
 
 @socketio.on('vendeurs_data')
 def handle_vendeurs_data(data):
+    update_activity_for_session()
     print(f'API: vendeurs_data received, pending_requests={pending_requests}')
     # Relay vendeurs data to the client who requested it
     for client_sid, reqs in list(pending_requests.items()):
@@ -517,6 +507,7 @@ def handle_get_clients_list(data):
 
 @socketio.on('clients_list_data')
 def handle_clients_list_data(data):
+    update_activity_for_session()
     print(f'API: clients_list_data received, pending_requests={pending_requests}')
     # Relay clients list data to the client who requested it
     for client_sid, reqs in list(pending_requests.items()):
@@ -553,12 +544,7 @@ def handle_get_usernames(data):
 
 @socketio.on('usernames_list_response')
 def handle_usernames_list_response(data):
-    # Update activity for the store that sent this response
-    sid = request.sid
-    for store_code, store_sid in store_sessions.items():
-        if store_sid == sid:
-            update_store_activity(store_code)
-            break
+    update_activity_for_session()
     client_sid = data.get('client_sid')
     users = data.get('users', [])
     error = data.get('error')
@@ -614,6 +600,7 @@ def handle_get_treasury(data):
 
 @socketio.on('treasury_data')
 def handle_treasury_data(data):
+    update_activity_for_session()
     client_sid = data.get('client_sid')
     if not client_sid:
         return
@@ -650,6 +637,7 @@ def handle_get_fournisseurs(data):
 
 @socketio.on('fournisseurs_data')
 def handle_fournisseurs_data(data):
+    update_activity_for_session()
     for client_sid, reqs in list(pending_requests.items()):
         for i, req in enumerate(reqs):
             if req['type'] == 'fournisseurs':
@@ -678,6 +666,7 @@ def handle_get_factures_achat(data):
 
 @socketio.on('factures_achat_data')
 def handle_factures_achat_data(data):
+    update_activity_for_session()
     for client_sid, reqs in list(pending_requests.items()):
         for i, req in enumerate(reqs):
             if req['type'] == 'factures_achat':
@@ -706,6 +695,7 @@ def handle_get_facture_achat_details(data):
 
 @socketio.on('facture_achat_details_data')
 def handle_facture_achat_details_data(data):
+    update_activity_for_session()
     for client_sid, reqs in list(pending_requests.items()):
         for i, req in enumerate(reqs):
             if req['type'] == 'facture_achat_details':
@@ -740,6 +730,7 @@ def handle_get_factures_vente(data):
 
 @socketio.on('factures_vente_data')
 def handle_factures_vente_data(data):
+    update_activity_for_session()
     print(f'API Backend: factures_vente_data received: {data}')
     for client_sid, reqs in list(pending_requests.items()):
         if not isinstance(reqs, list):
@@ -776,6 +767,7 @@ def handle_get_facture_vente_details(data):
 
 @socketio.on('facture_vente_details_data')
 def handle_facture_vente_details_data(data):
+    update_activity_for_session()
     print(f'API: facture_vente_details_data received, pending_requests={pending_requests}')
     for client_sid, reqs in list(pending_requests.items()):
         if not isinstance(reqs, list):
@@ -831,12 +823,7 @@ def handle_test_event(data):
 @socketio.on('heartbeat')
 def handle_heartbeat(data):
     """Handle heartbeat from backend to update activity tracking"""
-    # Use exact same pattern as other handlers that work (products_data, login_response, etc.)
-    sid = request.sid
-    for store_code, store_sid in store_sessions.items():
-        if store_sid == sid:
-            update_store_activity(store_code)
-            break
+    update_activity_for_session()
 
 # Track last activity time for each store (any event from backend)
 store_last_activity = {}  # store_code: timestamp
@@ -846,10 +833,18 @@ def update_store_activity(store_code):
     if store_code:
         store_last_activity[store_code] = time.time()
 
+def update_activity_for_session():
+    """Update activity for any backend session - called before processing any backend event"""
+    sid = request.sid
+    for store_code, store_sid in store_sessions.items():
+        if store_sid == sid:
+            update_store_activity(store_code)
+            break
+
 def check_store_connections():
     """Periodically check if store sessions are still alive and update database status"""
     while True:
-        gevent.sleep(30)  # Check every 30 seconds - rely on disconnect event for instant detection
+        gevent.sleep(10)  # Check every 10 seconds
         try:
             current_time = time.time()
             stores_to_check = list(store_sessions.keys())
@@ -859,37 +854,35 @@ def check_store_connections():
                 if not store_sid:
                     continue
                 
-                # Use activity timeout ONLY as backup - Socket.IO disconnect event handles instant detection
-                # Only check if no activity for a very long time (3 minutes) to catch truly dead connections
-                # that somehow didn't trigger disconnect event
-                last_activity = store_last_activity.get(store_code, 0)
-                if last_activity == 0:
-                    # Store just registered, initialize with current time
-                    store_last_activity[store_code] = current_time
-                    continue
-                
-                time_since_activity = current_time - last_activity
-                
-                # 180 seconds (3 minutes) - very conservative, only catches truly dead connections
-                # Socket.IO's disconnect event should handle normal disconnects instantly
-                # This is just a safety net for edge cases where disconnect event might be missed
-                if time_since_activity > 180:
-                    # Double-check: only mark offline if store_sid still exists (session might have been cleaned up)
-                    if store_code in store_sessions and store_sessions[store_code] == store_sid:
-                        print(f"Store {store_code} has no activity in {time_since_activity:.1f} seconds, marking as offline (safety net)")
-                        if store_code in store_sessions:
-                            del store_sessions[store_code]
-                        if store_code in store_last_activity:
-                            del store_last_activity[store_code]
-                        try:
-                            conn = get_api_db_connection()
-                            with conn.cursor() as cursor:
-                                sql = "UPDATE stores SET status='OFFLINE' WHERE store_code=%s"
-                                cursor.execute(sql, (store_code,))
-                                conn.commit()
-                            conn.close()
-                        except Exception as db_error:
-                            print(f"Error updating store status to OFFLINE: {db_error}")
+                    # Use activity timeout as backup - Socket.IO disconnect event handles instant detection
+                    # Check every 10 seconds, timeout after 60 seconds of no activity
+                    last_activity = store_last_activity.get(store_code, 0)
+                    if last_activity == 0:
+                        # Store just registered, initialize with current time
+                        store_last_activity[store_code] = current_time
+                        continue
+                    
+                    time_since_activity = current_time - last_activity
+                    
+                    # 60 seconds timeout - if no activity for 60s, mark offline
+                    # Heartbeats every 5s should keep this updated, so 60s means truly dead
+                    if time_since_activity > 60:
+                        # Double-check: only mark offline if store_sid still exists (session might have been cleaned up)
+                        if store_code in store_sessions and store_sessions[store_code] == store_sid:
+                            print(f"Store {store_code} has no activity in {time_since_activity:.1f} seconds, marking as offline")
+                            if store_code in store_sessions:
+                                del store_sessions[store_code]
+                            if store_code in store_last_activity:
+                                del store_last_activity[store_code]
+                            try:
+                                conn = get_api_db_connection()
+                                with conn.cursor() as cursor:
+                                    sql = "UPDATE stores SET status='OFFLINE' WHERE store_code=%s"
+                                    cursor.execute(sql, (store_code,))
+                                    conn.commit()
+                                conn.close()
+                            except Exception as db_error:
+                                print(f"Error updating store status to OFFLINE: {db_error}")
         except Exception as e:
             print(f"Error in store connection check: {e}")
 
