@@ -133,7 +133,7 @@ def handle_register_store(data):
     except Exception as e:
         print(f"Error updating store status to ONLINE: {e}")
     emit('register_store_response', {'success': True, 'store_code': store_code})
-    print(f"Store registered: {store_code}, sid: {request.sid}")
+    print(f"Store registered: {store_code}, sid: {request.sid}, activity initialized at {store_last_activity.get(store_code, 'unknown')}")
     # Notify all clients bound to this store that backend is online
     socketio.emit('store_online', {'store_code': store_code}, room=store_code)
 
@@ -833,10 +833,22 @@ def handle_test_event(data):
 @socketio.on('heartbeat')
 def handle_heartbeat(data):
     """Handle heartbeat from backend to update activity tracking"""
-    store_code = data.get('store_code')
+    # First try to get store_code from data
+    store_code = data.get('store_code') if data else None
+    
+    # If not in data, find it from session ID (like other handlers do)
+    if not store_code:
+        sid = request.sid
+        for code, store_sid in store_sessions.items():
+            if store_sid == sid:
+                store_code = code
+                break
+    
     if store_code:
         update_store_activity(store_code)
-        # Don't emit response - just update activity silently
+        print(f"[HEARTBEAT] Received heartbeat from store {store_code}, updated activity")
+    else:
+        print(f"[HEARTBEAT] WARNING: Received heartbeat but could not identify store (sid={request.sid})")
 
 # Track last activity time for each store (any event from backend)
 store_last_activity = {}  # store_code: timestamp
@@ -844,7 +856,13 @@ store_last_activity = {}  # store_code: timestamp
 def update_store_activity(store_code):
     """Update last activity timestamp for a store"""
     if store_code:
-        store_last_activity[store_code] = time.time()
+        old_time = store_last_activity.get(store_code, 0)
+        new_time = time.time()
+        store_last_activity[store_code] = new_time
+        if old_time > 0:
+            elapsed = new_time - old_time
+            if elapsed > 60:  # Only log if it's been a while (to reduce log spam)
+                print(f"[ACTIVITY] Updated activity for {store_code} (was {elapsed:.1f}s since last update)")
 
 def check_store_connections():
     """Periodically check if store sessions are still alive and update database status"""
@@ -884,11 +902,16 @@ def check_store_connections():
                     
                     time_since_activity = current_time - last_activity
                     
-                    # Use 120 seconds timeout: ping_interval (25s) + ping_timeout (90s) + buffer (5s)
-                    # This ensures Socket.IO has plenty of time to detect dead connections
-                    # before we mark the store as offline
-                    if time_since_activity > 120:
-                        print(f"Store {store_code} has no activity in {time_since_activity:.1f} seconds, marking as offline")
+                    # Use 90 seconds timeout to account for:
+                    # - Heartbeat every 5 seconds (so ~18 heartbeats per timeout period)
+                    # - Network delays and temporary issues
+                    # - Allows for multiple missed heartbeats while still detecting dead backends quickly
+                    if time_since_activity > 90:
+                        print(f"Store {store_code} has no activity in {time_since_activity:.1f} seconds (timeout=90s), marking as offline")
+                        print(f"  Last activity was at: {time.time() - last_activity:.1f} seconds ago")
+                        print(f"  Current time: {current_time}")
+                        print(f"  Store sessions: {list(store_sessions.keys())}")
+                        print(f"  Store activity times: {store_last_activity}")
                         # Remove from sessions
                         if store_code in store_sessions:
                             del store_sessions[store_code]
