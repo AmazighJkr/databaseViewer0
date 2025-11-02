@@ -841,7 +841,7 @@ def update_store_activity(store_code):
 def check_store_connections():
     """Periodically check if store sessions are still alive and update database status"""
     while True:
-        gevent.sleep(2)  # Check every 2 seconds for very fast detection
+        gevent.sleep(2)  # Check every 2 seconds for fast detection
         try:
             current_time = time.time()
             stores_to_check = list(store_sessions.keys())
@@ -849,8 +849,10 @@ def check_store_connections():
             for store_code in stores_to_check:
                 store_sid = store_sessions.get(store_code)
                 if store_sid:
-                    # Check if we've received any activity recently
-                    # Fast detection: 5 seconds timeout for immediate response
+                    # Check activity timeout
+                    # Use 30 seconds to allow for SocketIO's ping/pong mechanism (ping_interval is 25s)
+                    # This ensures we don't mark idle but connected stores as offline
+                    # SocketIO automatically handles ping/pong every 25 seconds to keep connections alive
                     last_activity = store_last_activity.get(store_code, 0)
                     if last_activity == 0:
                         # Store just registered, initialize with current time
@@ -859,10 +861,10 @@ def check_store_connections():
                     
                     time_since_activity = current_time - last_activity
                     
-                    # If no activity in last 5 seconds, consider connection dead
-                    # This ensures very fast detection when backend is killed
-                    # 5 seconds is fast enough to detect dead connections immediately
-                    if time_since_activity > 5:
+                    # If no activity in last 30 seconds, consider connection dead
+                    # 30 seconds is faster than ping_interval (25s) to catch dead backends quickly
+                    # But allows for normal ping/pong delays. Detection happens within ~30-32 seconds
+                    if time_since_activity > 30:
                         print(f"Store {store_code} has no activity in {time_since_activity} seconds, marking as offline")
                         # Remove from sessions
                         if store_code in store_sessions:
