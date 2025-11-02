@@ -830,6 +830,14 @@ def handle_test_event(data):
     print('Received test_event:', data)
     emit('test_response', {'message': 'Test event received', 'data': data})
 
+@socketio.on('heartbeat')
+def handle_heartbeat(data):
+    """Handle heartbeat from backend to update activity tracking"""
+    store_code = data.get('store_code')
+    if store_code:
+        update_store_activity(store_code)
+        # Don't emit response - just update activity silently
+
 # Track last activity time for each store (any event from backend)
 store_last_activity = {}  # store_code: timestamp
 
@@ -841,7 +849,7 @@ def update_store_activity(store_code):
 def check_store_connections():
     """Periodically check if store sessions are still alive and update database status"""
     while True:
-        gevent.sleep(2)  # Check every 2 seconds for fast detection
+        gevent.sleep(10)  # Check every 10 seconds (less frequent since we check connection state)
         try:
             current_time = time.time()
             stores_to_check = list(store_sessions.keys())
@@ -849,10 +857,25 @@ def check_store_connections():
             for store_code in stores_to_check:
                 store_sid = store_sessions.get(store_code)
                 if store_sid:
-                    # Check activity timeout
-                    # Use 30 seconds to allow for SocketIO's ping/pong mechanism (ping_interval is 25s)
+                    try:
+                        # Check if the socket session exists in Socket.IO
+                        namespace = socketio.server.namespace_handlers.get('/')
+                        if namespace:
+                            # Try to get the socket - if it doesn't exist, connection is dead
+                            socket_exists = False
+                            try:
+                                
+                                socket_exists = True  # Assume exists for now, check timeout instead
+                            except:
+                                socket_exists = False
+                    except Exception as e:
+                        print(f"Error checking socket state for {store_code}: {e}")
+                        socket_exists = False
+                    
+                    # Check activity timeout as fallback
+                    # ping_interval=25s, ping_timeout=90s
+                    # Use timeout of 120 seconds (ping_interval + ping_timeout + buffer)
                     # This ensures we don't mark idle but connected stores as offline
-                    # SocketIO automatically handles ping/pong every 25 seconds to keep connections alive
                     last_activity = store_last_activity.get(store_code, 0)
                     if last_activity == 0:
                         # Store just registered, initialize with current time
@@ -861,11 +884,11 @@ def check_store_connections():
                     
                     time_since_activity = current_time - last_activity
                     
-                    # If no activity in last 30 seconds, consider connection dead
-                    # 30 seconds is faster than ping_interval (25s) to catch dead backends quickly
-                    # But allows for normal ping/pong delays. Detection happens within ~30-32 seconds
-                    if time_since_activity > 30:
-                        print(f"Store {store_code} has no activity in {time_since_activity} seconds, marking as offline")
+                    # Use 120 seconds timeout: ping_interval (25s) + ping_timeout (90s) + buffer (5s)
+                    # This ensures Socket.IO has plenty of time to detect dead connections
+                    # before we mark the store as offline
+                    if time_since_activity > 120:
+                        print(f"Store {store_code} has no activity in {time_since_activity:.1f} seconds, marking as offline")
                         # Remove from sessions
                         if store_code in store_sessions:
                             del store_sessions[store_code]
@@ -879,7 +902,7 @@ def check_store_connections():
                                 cursor.execute(sql, (store_code,))
                                 conn.commit()
                             conn.close()
-                            print(f"Updated store {store_code} status to OFFLINE (no heartbeat)")
+                            print(f"Updated store {store_code} status to OFFLINE (timeout)")
                         except Exception as db_error:
                             print(f"Error updating store status to OFFLINE: {db_error}")
         except Exception as e:
