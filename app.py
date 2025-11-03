@@ -1,939 +1,929 @@
-import time
 import pymysql
-import socketio
-import decimal
-import configparser
-import os
-import urllib3
-import threading
+from flask import Flask, jsonify, request
+from flask_socketio import SocketIO, emit, join_room, leave_room
+import gevent
+import time
 
-# Load backend configuration
-CONFIG_FILE = 'backend_config.ini'
-config = configparser.ConfigParser()
-if os.path.exists(CONFIG_FILE):
-    config.read(CONFIG_FILE)
-else:
-    # Create a default config file
-    config['STORE'] = {
-        'store_code': 'store1',
-        'auth_code': 'denzer'
-    }
-    config['DATABASE'] = {
-        'host': 'localhost',
-        'user': 'root',
-        'password': '',
-        'user_database': 'user',
-        'business_database': 'stokyo'
-    }
-    config['API'] = {
-        'url': 'https://databaseviewer0.onrender.com'
-    }
-    with open(CONFIG_FILE, 'w') as f:
-        config.write(f)
-    print(f"Created default {CONFIG_FILE}. Please edit it and restart.")
-    raise SystemExit(1)
-
-API_URL = config.get('API', 'url')
-STORE_CODE = config.get('STORE', 'store_code')
-AUTH_CODE = config.get('STORE', 'auth_code')
-
-# Connect to local MySQL database
-DB_CONFIG_USER = {
-    'host': config.get('DATABASE', 'host'),
-    'user': config.get('DATABASE', 'user'),
-    'password': config.get('DATABASE', 'password'),
-    'database': config.get('DATABASE', 'user_database'),
-}
-DB_CONFIG_STOCKIO = {
-    'host': config.get('DATABASE', 'host'),
-    'user': config.get('DATABASE', 'user'),
-    'password': config.get('DATABASE', 'password'),
-    'database': config.get('DATABASE', 'business_database'),
-}
-
-def get_db_connection():
-    return pymysql.connect(**DB_CONFIG_USER)
-
-def get_stockio_connection():
-    return pymysql.connect(**DB_CONFIG_STOCKIO)
-
-# Silence insecure HTTPS warning (we intentionally disable SSL verification for this controlled setup)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Increase Engine.IO request timeout and prefer websocket transport to avoid polling timeouts
-sio = socketio.Client(
-    ssl_verify=False,
-    reconnection=True,
-    reconnection_attempts=0,
-    reconnection_delay=1,
-    reconnection_delay_max=30,
-    request_timeout=30
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+# Tighter, mobile-friendly Engine.IO settings: longer ping timeout, reasonable ping interval
+socketio = SocketIO(
+    app,
+    async_mode='gevent',
+    cors_allowed_origins='*',
+    ping_interval=5,
+    ping_timeout=15
 )
-# --- OFFLINE SNAPSHOT BACKEND ---
-@sio.on('get_snapshot_table')
-def on_get_snapshot_table(data):
-    client_sid = data.get('client_sid')
-    table = data.get('table')
-    offset = int(data.get('offset', 0))
-    limit = int(data.get('limit', 1000))
-    if not table:
-        sio.emit('snapshot_table_data', {'client_sid': client_sid, 'table': table or '', 'error': 'MISSING_TABLE'})
+
+# Store active store and client sessions
+store_sessions = {}  # store_code: sid
+client_sessions = {}  # sid: store_code
+pending_logins = {}  # client_sid: (store_code, username, password)
+# For stock requests
+# Change pending_requests to allow multiple requests per client
+# pending_requests: {client_sid: [request_dict, ...]}
+pending_requests = {}  # client_sid: [ {'type': ..., ...}, ... ]
+# --- OFFLINE SNAPSHOT RELAY ---
+@socketio.on('get_snapshot_table')
+def handle_get_snapshot_table(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    table = (data or {}).get('table')
+    if not store_code or not table:
+        emit('snapshot_table_data', {'error': 'Missing store or table', 'table': table or ''})
         return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('snapshot_table_data', {'error': 'Store backend not connected', 'table': table})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'snapshot', 'store_code': store_code, 'table': table})
+    payload = {
+        'client_sid': client_sid,
+        'table': table,
+        'offset': int((data or {}).get('offset', 0)),
+        'limit': int((data or {}).get('limit', 1000)),
+    }
+    socketio.emit('get_snapshot_table', payload, room=store_sid)
+
+@socketio.on('snapshot_table_data')
+def handle_snapshot_table_data(data):
+    table = (data or {}).get('table')
+    client_sid = (data or {}).get('client_sid')
+    if not client_sid:
+        # Fallback: deliver to first snapshot requester
+        for csid, reqs in list(pending_requests.items()):
+            for i, req in enumerate(reqs):
+                if req.get('type') == 'snapshot' and req.get('table') == table:
+                    socketio.emit('snapshot_table_data', data, room=csid)
+                    del pending_requests[csid][i]
+                    if not pending_requests[csid]:
+                        del pending_requests[csid]
+                    return
+        return
+    # Route directly to requesting client
+    socketio.emit('snapshot_table_data', data, room=client_sid)
+
+
+# --- DB connection helper ---
+def get_api_db_connection():
+    # For API store authentication, connect to the 'stores' database
+    return pymysql.connect(host='db4free.net', user='vmmachine03', password='vmmachine03', database='vmmachine03')
+
+@app.route('/')
+def index():
+    return jsonify({'message': 'API is running'})
+
+@app.route('/api/store_status/<store_code>')
+def get_store_status(store_code):
+    """REST endpoint to check store status (ONLINE or OFFLINE)"""
     try:
-        conn = get_stockio_connection()
+        conn = get_api_db_connection()
         with conn.cursor() as cursor:
-            # Count total rows once when offset == 0
-            total = None
-            if offset == 0:
-                cursor.execute(f"SELECT COUNT(*) FROM `{table}`")
-                total = cursor.fetchone()[0]
-            # Stream a chunk
-            cursor.execute(f"SELECT * FROM `{table}` LIMIT %s OFFSET %s", (limit, offset))
-            rows = cursor.fetchall()
-            # Column names for mapping
-            cols = [d[0] for d in cursor.description] if cursor.description else []
+            # Check if store exists and get its status
+            sql = "SELECT status FROM stores WHERE store_code=%s LIMIT 1"
+            cursor.execute(sql, (store_code,))
+            row = cursor.fetchone()
         conn.close()
-        # Build JSON-safe chunk
-        def to_json_row(row):
-            obj = {}
-            for i, col in enumerate(cols):
-                val = row[i] if i < len(row) else None
-                if isinstance(val, (time.struct_time,)):
-                    try:
-                        obj[col] = str(val)
-                    except Exception:
-                        obj[col] = None
-                elif isinstance(val, (decimal.Decimal,)):
-                    obj[col] = float(val)
-                else:
-                    obj[col] = val
-            return obj
-        payload = {
-            'client_sid': client_sid,
-            'table': table,
-            'offset': offset,
-            'limit': limit,
-            'total': total,
-            'rows': [to_json_row(r) for r in rows],
-            'error': None
-        }
-        sio.emit('snapshot_table_data', payload)
+        if row:
+            status = row[0] if row[0] else 'OFFLINE'  # Default to OFFLINE if NULL
+            return jsonify({'store_code': store_code, 'status': status})
+        else:
+            return jsonify({'store_code': store_code, 'status': 'OFFLINE', 'error': 'Store not found'}), 404
     except Exception as e:
-        sio.emit('snapshot_table_data', {'client_sid': client_sid, 'table': table, 'offset': offset, 'limit': limit, 'total': None, 'rows': [], 'error': str(e)})
+        return jsonify({'store_code': store_code, 'status': 'OFFLINE', 'error': str(e)}), 500
 
-@sio.event
-def connect():
-    print('Connected to API')
-    # Register this store with the API
-    sio.emit('register_store', {'store_code': STORE_CODE, 'auth_code': AUTH_CODE})
-    # Start heartbeat to keep connection alive and update activity
-    start_heartbeat()
-
-@sio.on('register_store_response')
-def on_register_store_response(data):
-    if data.get('success'):
-        print(f"Store registered successfully: {data['store_code']}")
-    else:
-        print(f"Failed to register store: {data.get('error')}")
-
-heartbeat_thread = None
-heartbeat_running = False
-
-def start_heartbeat():
-    """Start a background thread that sends heartbeat every 30 seconds"""
-    global heartbeat_thread, heartbeat_running
-    if heartbeat_running:
+@socketio.on('register_store')
+def handle_register_store(data):
+    store_code = data.get('store_code')
+    auth_code = data.get('auth_code')
+    if not store_code or not auth_code:
+        emit('register_store_response', {'success': False, 'error': 'Missing store code or auth code'})
         return
-    heartbeat_running = True
-    
-    def heartbeat_loop():
-        while heartbeat_running and sio.connected:
-            try:
-                time.sleep(30)  # Send heartbeat every 30 seconds
-                if heartbeat_running and sio.connected:
-                    # Send a simple heartbeat event to update activity
-                    sio.emit('heartbeat', {'store_code': STORE_CODE})
-                    print(f"[HEARTBEAT] Sent heartbeat for {STORE_CODE}")
-            except Exception as e:
-                print(f"[HEARTBEAT] Error: {e}")
-                break
-        print("[HEARTBEAT] Heartbeat thread stopped")
-    
-    heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
-    heartbeat_thread.start()
-    print("[HEARTBEAT] Heartbeat thread started")
+    # Check credentials in the API database
+    try:
+        conn = get_api_db_connection()
+        with conn.cursor() as cursor:
+            sql = "SELECT id FROM stores WHERE store_code=%s AND auth_code=%s LIMIT 1"
+            cursor.execute(sql, (store_code, auth_code))
+            row = cursor.fetchone()
+        conn.close()
+        if not row:
+            emit('register_store_response', {'success': False, 'error': 'Invalid store code or auth code'})
+            return
+    except Exception as e:
+        emit('register_store_response', {'success': False, 'error': f'Database error: {e}'})
+        return
+    # Always update to latest sid so reconnect rebinds correctly
+    store_sessions[store_code] = request.sid
+    join_room(store_code)
+    # Initialize activity tracking (use current time) - heartbeats will keep this updated
+    update_store_activity(store_code)
+    # Update store status to ONLINE in database
+    try:
+        conn = get_api_db_connection()
+        with conn.cursor() as cursor:
+            sql = "UPDATE stores SET status='ONLINE' WHERE store_code=%s"
+            cursor.execute(sql, (store_code,))
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error updating store status to ONLINE: {e}")
+    emit('register_store_response', {'success': True, 'store_code': store_code})
+    print(f"Store registered: {store_code}, sid: {request.sid}, activity initialized at {store_last_activity.get(store_code, 'unknown')}")
+    # Notify all clients bound to this store that backend is online
+    socketio.emit('store_online', {'store_code': store_code}, room=store_code)
 
-def stop_heartbeat():
-    """Stop the heartbeat thread"""
-    global heartbeat_running
-    heartbeat_running = False
+@socketio.on('register_client')
+def handle_register_client(data):
+    store_code = data.get('store_code')
+    if not store_code:
+        emit('register_client_response', {'success': False, 'error': 'Missing store code'})
+        return
+    # Allow client to register even if backend currently offline; it will receive errors per-request
+    try:
+        conn = get_api_db_connection()
+        with conn.cursor() as cursor:
+            sql = "SELECT name FROM stores WHERE store_code=%s LIMIT 1"
+            cursor.execute(sql, (store_code,))
+            row = cursor.fetchone()
+        conn.close()
+        store_name = row[0] if row else ""
+    except Exception as e:
+        store_name = ""
+    # Then, when emitting register_client_response or login_result:
+    client_sessions[request.sid] = store_code
+    join_room(store_code)
+    emit('register_client_response', {'success': True, 'store_code': store_code, 'store_name': store_name})
+    print(f"Client registered for store: {store_code}, sid: {request.sid}")
+    # Immediately inform client about backend availability
+    if store_code not in store_sessions:
+        socketio.emit('store_offline', {'store_code': store_code}, room=request.sid)
 
-@sio.event
-def disconnect():
-    print('Disconnected from API')
-    stop_heartbeat()
-    # The client has auto-reconnect enabled; no action needed here
-
-# Handle login requests from API
-@sio.on('login_request')
-def on_login_request(data):
-    client_sid = data.get('client_sid')
+# --- Secure login relay ---
+@socketio.on('login')
+def handle_login(data):
+    store_code = data.get('store_code')
     username = data.get('username')
     password = data.get('password')
-    result = {'client_sid': client_sid, 'success': False, 'error': 'Invalid credentials', 'user_info': None}
-    if not username or not password:
-        result['error'] = 'Missing username or password'
-        sio.emit('login_response', result)
+    client_sid = request.sid
+    if not store_code or not username or not password:
+        emit('login_result', {'success': False, 'error': 'Missing fields'})
         return
+    # Find the Windows backend for this store
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('login_result', {'success': False, 'error': 'Store backend not connected'})
+        return
+    # Save pending login to match response
+    pending_logins[client_sid] = (store_code, username, password)
+    # Forward login request to Windows backend
+    socketio.emit('login_request', {
+        'client_sid': client_sid,
+        'username': username,
+        'password': password
+    }, room=store_sid)
+    print(f"Forwarded login for user '{username}' to store '{store_code}' backend.")
+
+@socketio.on('login_response')
+def handle_login_response(data):
+    print(f"API: login_response received with data: {data}")
+    update_activity_for_session()
+    client_sid = data.get('client_sid')
+    success = data.get('success')
+    error = data.get('error')
+    user_info = data.get('user_info')
+    if not client_sid:
+        print("API: No client_sid in login_response")
+        return
+    # Get store_code from pending_logins
+    store_code = None
+    if client_sid in pending_logins:
+        store_code = pending_logins[client_sid][0]
+    # Relay result to Android client
+    # After verifying store_code and auth_code:
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            # Fetch all permission fields needed for BUTTONS_ACCESS
-            sql = """
-                SELECT iduser, np, nom, prenom, ventecompt, listeproduit, clients, survolrecept, survolvente, caisse, fournisseurs
-                FROM user
-                WHERE np=%s AND password=%s LIMIT 1
-            """
-            cursor.execute(sql, (username, password))
-            user = cursor.fetchone()
-        conn.close()
-        if user:
-            result['success'] = True
-            result['error'] = None
-            # Return user info and access rights for all mapped fields
-            result['user_info'] = {
-                'iduser': user[0],
-                'np': user[1],
-                'nom': user[2],
-                'prenom': user[3],
-                'ventecompt': user[4],
-                'listeproduit': user[5],
-                'clients': user[6],
-                'survolrecept': user[7],
-                'survolvente': user[8],
-                'caisse': user[9],
-                'fournisseurs': user[10],
-            }
-        else:
-            result['error'] = 'Invalid username or password'
+        store_name = ""
+        if store_code:
+            conn = get_api_db_connection()
+            with conn.cursor() as cursor:
+                sql = "SELECT name FROM stores WHERE store_code=%s LIMIT 1"
+                cursor.execute(sql, (store_code,))
+                row = cursor.fetchone()
+            conn.close()
+            store_name = row[0] if row else ""
     except Exception as e:
-        result['error'] = str(e)
-    sio.emit('login_response', result)
+        store_name = ""
+    print(f"API: Emitting login_result to client {client_sid}: success={success}, error={error}")
+    socketio.emit('login_result', {
+        'success': success,
+        'error': error,
+        'user_info': user_info,
+        'store_name': store_name
+    }, room=client_sid)
+    print(f"API: Relayed login result to client {client_sid}: {success}, {error}")
+    # Remove from pending
+    if client_sid in pending_logins:
+        del pending_logins[client_sid]
 
-# --- STOCK HANDLERS ---
-@sio.on('get_products')
-def on_get_products(data):
-    # Returns list of products with code, name, and total quantity from nomenc.qg
-    try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            sql = '''SELECT p.nop, p.nom, COALESCE(s.qg, 0) as qte
-                     FROM prod p
-                     LEFT JOIN nomenc s ON p.nop = s.nop
-                     GROUP BY p.nop, p.nom, s.qg'''
-            cursor.execute(sql)
-            products = cursor.fetchall()
-        conn.close()
-        def to_str(val):
-            return str(val) if val is not None else ''
-        sio.emit('products_data', {'products': [
-            {'np': to_str(row[0]), 'produits': to_str(row[1]), 'qte': to_str(row[2])} for row in products
-        ]})
-    except Exception as e:
-        sio.emit('products_data', {'error': str(e)})
+# --- STOCK RELAY HANDLERS ---
+@socketio.on('get_products')
+def handle_get_products(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('products_data', {'error': 'Not registered for a store'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('products_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'products', 'store_code': store_code})
+    print(f'API: pending_requests after get_products: {pending_requests}')
+    socketio.emit('get_products', data, room=store_sid)
 
-@sio.on('get_product_details')
-def on_get_product_details(data):
-    # Returns all stock entries for a selected product, with total quantity from nomenc.qg
-    np = data.get('np')
-    try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            # Get all stoc entries for the product - include num field
-            sql = '''SELECT num, nop, pacha, q, pv, pgros, psgros FROM stoc WHERE nop = %s'''
-            cursor.execute(sql, (np,))
-            details = cursor.fetchall()
-            # Get total quantity from nomenc.qg
-            sql_qg = '''SELECT COALESCE(qg, 0) FROM nomenc WHERE nop = %s'''
-            cursor.execute(sql_qg, (np,))
-            qg_row = cursor.fetchone()
-            total_qte = qg_row[0] if qg_row else 0
-        conn.close()
-        def to_str(val, is_price=False):
-            if val is None:
-                return ''
-            try:
-                f = float(val)
-                return f"{f:.2f}" if is_price else str(val)
-            except Exception:
-                return str(val)
-        sio.emit('product_details_data', {
-            'details': [
-                {'num': to_str(row[0]), 'np': to_str(row[1]), 'pachat': to_str(row[2], True), 'qte': to_str(row[3]), 'pv1': to_str(row[4], True), 'pv2': to_str(row[5], True), 'pv3': to_str(row[6], True)} for row in details
-            ],
-            'total_qte': to_str(total_qte)
-        })
-    except Exception as e:
-        sio.emit('product_details_data', {'error': str(e)})
+# --- BARCODE RELAY HANDLERS ---
+@socketio.on('get_product_by_barcode')
+def handle_get_product_by_barcode(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('product_by_barcode_data', {'success': False, 'error': 'Not registered for a store'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('product_by_barcode_data', {'success': False, 'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'barcode', 'store_code': store_code})
+    print(f'API: pending_requests after get_product_by_barcode: {pending_requests}')
+    socketio.emit('get_product_by_barcode', data, room=store_sid)
 
-# --- BARCODE HANDLER ---
-@sio.on('get_product_by_barcode')
-def on_get_product_by_barcode(data):
-    barcode = data.get('barcode')
-    try:
-        if not barcode:
-            sio.emit('product_by_barcode_data', {'success': False, 'error': 'MISSING_BARCODE'})
-            return
-        # Normalize input
-        raw_barcode = str(barcode)
-        barcode = raw_barcode.strip()
-        print(f"[BARCODE] Received barcode='{raw_barcode}' -> normalized='{barcode}'")
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            # DEBUG: Show exact matches
-            try:
-                cursor.execute("SELECT nop, cbar, num FROM stoc WHERE cbar = %s ORDER BY num DESC LIMIT 5", (barcode,))
-                rows_dbg = cursor.fetchall()
-                print(f"[BARCODE] Exact cbar matches (top 5): {rows_dbg}")
-            except Exception as e_dbg:
-                print(f"[BARCODE] DEBUG exact query error: {e_dbg}")
-
-            # DEBUG: Show matches ignoring leading zeros
-            try:
-                cursor.execute("SELECT nop, cbar, num FROM stoc WHERE TRIM(LEADING '0' FROM cbar) = TRIM(LEADING '0' FROM %s) ORDER BY num DESC LIMIT 5", (barcode,))
-                rows_zero = cursor.fetchall()
-                print(f"[BARCODE] Trim-leading-zeros matches (top 5): {rows_zero}")
-            except Exception as e_dbg:
-                print(f"[BARCODE] DEBUG trim-leading-zeros query error: {e_dbg}")
-
-            # DEBUG: Show matches ignoring spaces/dashes
-            try:
-                cursor.execute("SELECT nop, cbar, num FROM stoc WHERE REPLACE(REPLACE(cbar,'-',''),' ', '') = REPLACE(REPLACE(%s,'-',''),' ', '') ORDER BY num DESC LIMIT 5", (barcode,))
-                rows_strip = cursor.fetchall()
-                print(f"[BARCODE] Strip spaces/dashes matches (top 5): {rows_strip}")
-            except Exception as e_dbg:
-                print(f"[BARCODE] DEBUG strip query error: {e_dbg}")
-
-            # 1) Resolve nop by cbar with filtering rule: ignore products with nop < 16
-            # Try exact, then ignoring leading zeros, spacing, dashes, and numeric equality
-            sql_candidates = (
-                "SELECT nop, num FROM stoc "
-                "WHERE cbar = %s "
-                "   OR TRIM(LEADING '0' FROM cbar) = TRIM(LEADING '0' FROM %s) "
-                "   OR (REPLACE(cbar,' ', '') = REPLACE(%s,' ', '')) "
-                "   OR (REPLACE(REPLACE(cbar,'-',''),' ', '') = REPLACE(REPLACE(%s,'-',''),' ', '')) "
-                "   OR (cbar REGEXP '^[0-9]+' AND %s REGEXP '^[0-9]+' AND CAST(cbar AS UNSIGNED) = CAST(%s AS UNSIGNED)) "
-                "ORDER BY num DESC LIMIT 20"
-            )
-            cursor.execute(sql_candidates, (barcode, barcode, barcode, barcode, barcode, barcode))
-            candidate_rows = cursor.fetchall() or []
-            print(f"[BARCODE] Candidate nops ordered by latest num (top 20): {candidate_rows}")
-            chosen_nop = None
-            for cand in candidate_rows:
-                try:
-                    cand_nop_int = int(cand[0])
-                except Exception:
-                    continue
-                if cand_nop_int >= 16:
-                    chosen_nop = cand_nop_int
-                    break
-            if chosen_nop is None:
-                conn.close()
-                print(f"[BARCODE] No candidate with nop >= 16 for '{barcode}'. Ignoring lower nops.")
-                sio.emit('product_by_barcode_data', {'success': False, 'error': 'NOT_FOUND'})
+@socketio.on('product_by_barcode_data')
+def handle_product_by_barcode_data(data):
+    update_activity_for_session()
+    print(f'API: product_by_barcode_data received, pending_requests={pending_requests}')
+    for client_sid, reqs in list(pending_requests.items()):
+        if not isinstance(reqs, list):
+            print(f"WARNING: pending_requests[{client_sid}] is not a list, skipping: {reqs}")
+            continue
+        for i, req in enumerate(reqs):
+            if req['type'] == 'barcode':
+                print(f'API: relaying product_by_barcode_data to client_sid={client_sid}')
+                # Payload may contain only {'success': True, 'name': '...'} now
+                socketio.emit('product_by_barcode_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
                 return
-            nop = chosen_nop
 
-            # 2) Compose product fields
-            # Name from prod
-            sql_name = 'SELECT nom FROM prod WHERE nop = %s LIMIT 1'
-            cursor.execute(sql_name, (nop,))
-            name_row = cursor.fetchone()
-            name = name_row[0] if name_row else ''
-            print(f"[BARCODE] name lookup: nop={nop} -> nom='{name}'")
+@socketio.on('products_data')
+def handle_products_data(data):
+    update_activity_for_session()
+    print(f'API: products_data received, pending_requests={pending_requests}')
+    for client_sid, reqs in list(pending_requests.items()):
+        if not isinstance(reqs, list):
+            print(f"WARNING: pending_requests[{client_sid}] is not a list, skipping: {reqs}")
+            continue
+        for i, req in enumerate(reqs):
+            if req['type'] == 'products':
+                print(f'API: relaying products_data to client_sid={client_sid}')
+                socketio.emit('products_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
 
-            # Total quantity from nomenc.qg
-            sql_qg = 'SELECT COALESCE(qg,0) FROM nomenc WHERE nop = %s'
-            cursor.execute(sql_qg, (nop,))
-            qg_row = cursor.fetchone()
-            qte_total = qg_row[0] if qg_row else 0
-            print(f"[BARCODE] qg lookup: nop={nop} -> qg={qte_total}")
+@socketio.on('get_product_details')
+def handle_get_product_details(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    np = data.get('np')
+    if not store_code or not np:
+        emit('product_details_data', {'error': 'Missing store or product code'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('product_details_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'details', 'store_code': store_code, 'np': np})
+    print(f'API: pending_requests after get_product_details: {pending_requests}')
+    socketio.emit('get_product_details', {'np': np}, room=store_sid)
 
-            # No need to read supplier or price data for barcode search; keep it lightweight
-        conn.close()
+@socketio.on('product_details_data')
+def handle_product_details_data(data):
+    update_activity_for_session()
+    print(f'API: product_details_data received, pending_requests={pending_requests}')
+    for client_sid, reqs in list(pending_requests.items()):
+        if not isinstance(reqs, list):
+            print(f"WARNING: pending_requests[{client_sid}] is not a list, skipping: {reqs}")
+            continue
+        for i, req in enumerate(reqs):
+            if req['type'] == 'details':
+                print(f'API: relaying product_details_data to client_sid={client_sid}')
+                socketio.emit('product_details_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
 
-        def to_str(val, is_price=False):
-            if val is None:
-                return ''
+@socketio.on('get_clients')
+def handle_get_clients(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('clients_data', {'error': 'Not registered for a store'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('clients_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'clients', 'store_code': store_code})
+    print(f'API: pending_requests after get_clients: {pending_requests}')
+    socketio.emit('get_clients', data, room=store_sid)
+
+@socketio.on('clients_data')
+def handle_clients_data(data):
+    update_activity_for_session()
+    print(f'API: clients_data received, pending_requests={pending_requests}')
+    for client_sid, reqs in list(pending_requests.items()):
+        if not isinstance(reqs, list):
+            print(f"WARNING: pending_requests[{client_sid}] is not a list, skipping: {reqs}")
+            continue
+        for i, req in enumerate(reqs):
+            if req['type'] == 'clients':
+                print(f'API: relaying clients_data to client_sid={client_sid}')
+                socketio.emit('clients_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
+
+@socketio.on('get_sales')
+def handle_get_sales(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('sales_data', {'error': 'Not registered for a store'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('sales_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'sales', 'store_code': store_code})
+    print(f'API: pending_requests after get_sales: {pending_requests}')
+    socketio.emit('get_sales', data, room=store_sid)
+
+@socketio.on('sales_data')
+def handle_sales_data(data):
+    update_activity_for_session()
+    print(f'API: sales_data received, pending_requests={pending_requests}')
+    for client_sid, reqs in list(pending_requests.items()):
+        if not isinstance(reqs, list):
+            print(f"WARNING: pending_requests[{client_sid}] is not a list, skipping: {reqs}")
+            continue
+        for i, req in enumerate(reqs):
+            if req['type'] == 'sales':
+                print(f'API: relaying sales_data to client_sid={client_sid}')
+                socketio.emit('sales_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
+
+@socketio.on('get_sale_details')
+def handle_get_sale_details(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    sale_id = data.get('sale_id')
+    if not store_code or not sale_id:
+        emit('sale_details_data', {'error': 'Missing store or sale id'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('sale_details_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'sale_details', 'store_code': store_code, 'sale_id': sale_id})
+    print(f'API: pending_requests after get_sale_details: {pending_requests}')
+    socketio.emit('get_sale_details', {'sale_id': sale_id}, room=store_sid)
+
+@socketio.on('sale_details_data')
+def handle_sale_details_data(data):
+    update_activity_for_session()
+    print(f'API: sale_details_data received, pending_requests={pending_requests}')
+    for client_sid, reqs in list(pending_requests.items()):
+        if not isinstance(reqs, list):
+            print(f"WARNING: pending_requests[{client_sid}] is not a list, skipping: {reqs}")
+            continue
+        for i, req in enumerate(reqs):
+            if req['type'] == 'sale_details':
+                print(f'API: relaying sale_details_data to client_sid={client_sid}')
+                socketio.emit('sale_details_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
+
+@socketio.on('get_vendeurs')
+def handle_get_vendeurs(data):
+    client_sid = request.sid
+    print(f'API: get_vendeurs from client_sid={client_sid}')
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('vendeurs_data', {'error': 'Not registered for a store'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('vendeurs_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'vendeurs', 'store_code': store_code})
+    print(f'API: pending_requests after get_vendeurs: {pending_requests}')
+    socketio.emit('get_vendeurs', data, room=store_sid)
+
+@socketio.on('vendeurs_data')
+def handle_vendeurs_data(data):
+    update_activity_for_session()
+    print(f'API: vendeurs_data received, pending_requests={pending_requests}')
+    # Relay vendeurs data to the client who requested it
+    for client_sid, reqs in list(pending_requests.items()):
+        for i, req in enumerate(reqs):
+            if req['type'] == 'vendeurs':
+                print(f'API: relaying vendeurs_data to client_sid={client_sid}')
+                socketio.emit('vendeurs_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
+
+@socketio.on('get_clients_list')
+def handle_get_clients_list(data):
+    client_sid = request.sid
+    print(f'API: get_clients_list from client_sid={client_sid}')
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('clients_list_data', {'error': 'Not registered for a store'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('clients_list_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'clients_list', 'store_code': store_code})
+    print(f'API: pending_requests after get_clients_list: {pending_requests}')
+    socketio.emit('get_clients_list', data, room=store_sid)
+
+@socketio.on('clients_list_data')
+def handle_clients_list_data(data):
+    update_activity_for_session()
+    print(f'API: clients_list_data received, pending_requests={pending_requests}')
+    # Relay clients list data to the client who requested it
+    for client_sid, reqs in list(pending_requests.items()):
+        for i, req in enumerate(reqs):
+            if req['type'] == 'clients_list':
+                print(f'API: relaying clients_list_data to client_sid={client_sid}')
+                socketio.emit('clients_list_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
+
+@socketio.on('get_usernames')
+def handle_get_usernames(data):
+    store_code = data.get('store_code')
+    client_sid = request.sid
+    if not store_code:
+        emit('usernames_list', {'usernames': [], 'error': 'Missing store code'})
+        return
+    # Validate that the store backend is connected (store previously registered with auth_code)
+    if store_code not in store_sessions:
+        emit('usernames_list', {'usernames': [], 'error': 'Store backend not connected'})
+        return
+    # Relay to Windows backend - let it handle the response directly
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('usernames_list', {'usernames': [], 'error': 'Store backend not connected'})
+        return
+    
+    # Send request to backend - backend will respond directly to client
+    socketio.emit('get_usernames_request', {'client_sid': client_sid}, room=store_sid)
+    print(f"[API] Relayed get_usernames_request to backend for store {store_code}, client {client_sid}")
+    print(f"[API] Backend will respond directly to client {client_sid}")
+
+@socketio.on('usernames_list_response')
+def handle_usernames_list_response(data):
+    update_activity_for_session()
+    client_sid = data.get('client_sid')
+    users = data.get('users', [])
+    error = data.get('error')
+    
+    if not client_sid:
+        print(f"[API] usernames_list_response missing client_sid, data: {data}")
+        return
+    
+    if error:
+        print(f"[API] Backend error for client {client_sid}: {error}")
+        socketio.emit('usernames_list', {'usernames': [], 'users': [], 'error': error}, room=client_sid)
+        return
+    
+    # Derive usernames on the fly for UI convenience
+    usernames = []
+    if isinstance(users, list):
+        for u in users:
             try:
-                f = float(val)
-                return f"{f:.2f}" if is_price else str(val)
+                name = u.get('username') or u.get('np') or u.get('nom') or ''
+                if name:
+                    usernames.append(name)
             except Exception:
-                return str(val)
+                pass
+    else:
+        users = []
+    
+    response_data = {'usernames': usernames, 'users': users, 'error': None}
+    socketio.emit('usernames_list', response_data, room=client_sid)
+    print(f"[API] Relayed usernames_list to client {client_sid} (users: {len(users)}, usernames: {len(usernames)})")
 
-        # For barcode search, we only need the product name to drive the phone-side filter
-        print(f"[BARCODE] FOUND nop={nop}, name='{name}' -> sending name only")
-        sio.emit('product_by_barcode_data', {'success': True, 'name': str(name)})
-    except Exception as e:
-        print(f"[BARCODE] ERROR for '{barcode}': {e}")
-        sio.emit('product_by_barcode_data', {'success': False, 'error': str(e)})
+# Backend now sends usernames_list_response which we relay as usernames_list
 
-@sio.on('get_clients')
-def on_get_clients(data):
-    try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            # Use the correct column names based on the actual database schema
-            sql = '''SELECT idclient, np, adr, tel1, tel2, credit, email FROM clients'''
-            cursor.execute(sql)
-            clients = cursor.fetchall()
-        conn.close()
-        def to_str(val):
-            return str(val) if val is not None else ''
-        
-        if clients:
-            sio.emit('clients_data', {'clients': [
-                {
-                    'id': to_str(row[0]),
-                    'nom': to_str(row[1]),  # np column contains the name
-                    'adr': to_str(row[2]),
-                    'tel1': to_str(row[3]),
-                    'tel2': to_str(row[4]),
-                    'credit': to_str(row[5]),
-                    'email': to_str(row[6])
-                } for row in clients
-            ]})
-        else:
-            sio.emit('clients_data', {'clients': []})
-    except Exception as e:
-        sio.emit('clients_data', {'error': str(e)})
+@socketio.on('get_treasury')
+def handle_get_treasury(data):
+    # data: {'date_from': ..., 'date_to': ...}
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code or store_code not in store_sessions:
+        emit('treasury_data', {'success': False, 'error': 'Store not connected', 'data': {}, 'client_sid': client_sid})
+        return
+    backend_sid = store_sessions[store_code]
+    # Track pending request
+    req = {'type': 'get_treasury', 'client_sid': client_sid}
+    if client_sid not in pending_requests or not isinstance(pending_requests[client_sid], list):
+        pending_requests[client_sid] = []
+    pending_requests[client_sid].append(req)
+    # Relay to backend
+    socketio.emit('get_treasury', {
+        'date_from': data.get('date_from'),
+        'date_to': data.get('date_to'),
+        'client_sid': client_sid
+    }, room=backend_sid)
 
-@sio.on('get_usernames_request')
-def on_get_usernames_request(data):
+@socketio.on('treasury_data')
+def handle_treasury_data(data):
+    update_activity_for_session()
     client_sid = data.get('client_sid')
     if not client_sid:
-        print("[BACKEND] get_usernames_request missing client_sid")
         return
-    
-    # Single-list response: only 'users' is returned; client derives usernames
-    result = {'client_sid': client_sid, 'users': [], 'error': None}
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            # Return usernames and full profiles with permissions so mobile can cache offline
-            sql = (
-                "SELECT iduser, np, nom, prenom, password, ventecompt, listeproduit, clients, "
-                "survolrecept, survolvente, caisse, fournisseurs FROM user ORDER BY np"
-            )
-            cursor.execute(sql)
-            rows = cursor.fetchall()
-        conn.close()
-        
-        usernames = []
-        users = []
-        processed_count = 0
-        skipped_count = 0
-        
-        for row in rows:
-            try:
-                username = str(row[1]) if row[1] is not None else ''
-                if username and username.strip():
-                    username = username.strip()
-                    usernames.append(username)
-                    
-                    # Create full user profile
-                    # Send a single, normalized record per user with stable field names
-                    user_profile = {
-                        'username': username,  # explicit username field
-                        'iduser': int(row[0]) if row[0] is not None else 0,
-                        'np': username,  # keep legacy np for compatibility
-                        'nom': '' if row[2] is None else str(row[2]),
-                        'prenom': '' if row[3] is None else str(row[3]),
-                        'password': '' if row[4] is None else str(row[4]),
-                        'ventecompt': int(row[5] or 0),
-                        'listeproduit': int(row[6] or 0),
-                        'clients': int(row[7] or 0),
-                        'survolrecept': int(row[8] or 0),
-                        'survolvente': int(row[9] or 0),
-                        'caisse': int(row[10] or 0),
-                        'fournisseurs': int(row[11] or 0)
-                    }
-                    users.append(user_profile)
-                    processed_count += 1
-                    
-                    # Debug log for each user processed
-                    print(f"[BACKEND] Processed user: {username} (ID: {user_profile['iduser']}, Permissions: listeproduit={user_profile['listeproduit']}, clients={user_profile['clients']})")
-                else:
-                    skipped_count += 1
-                    print(f"[BACKEND] Skipped user with empty username: {row}")
-            except Exception as e:
-                skipped_count += 1
-                print(f"[BACKEND] Error processing user row {row}: {e}")
-                continue
-        
-        result['users'] = users
-        
-        print(f"[BACKEND] users count={len(users)}, processed={processed_count}, skipped={skipped_count}")
-        
-        if users:
-            print(f"[BACKEND] First user profile: {users[0]}")
-            if len(users) > 1:
-                print(f"[BACKEND] Second user profile: {users[1]}")
-            print(f"[BACKEND] Last user profile: {users[-1]}")
-        
-        # Debug: Show the complete result structure
-        print(f"[BACKEND] Complete result structure: {result}")
-        
-    except Exception as e:
-        error_msg = f"Database error: {str(e)}"
-        result['error'] = error_msg
-        print(f"[BACKEND] ERROR in get_usernames_request: {error_msg}")
-    
-    # Send a single response with everything - use the event name the Android app expects
-    # But send it through the API relay, not directly to client
-    sio.emit('usernames_list_response', result)
-    print(f"[BACKEND] Emitted usernames_list_response to API relay with {len(usernames)} usernames and {len(users)} user profiles")
-
-# --- SALES HANDLERS ---
-@sio.on('get_sales')
-def on_get_sales(data):
-    # Get sales data with filters
-    date_from = data.get('date_from')
-    date_to = data.get('date_to')
-    vendeur = data.get('vendeur')
-    client = data.get('client')
-    
-    try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            # Build the query with correct cross-database join
-            sql = '''SELECT v.nov, v.datv, c.np as client_name, u.np as vendeur_name, v.verse
-                     FROM vente v
-                     LEFT JOIN clients c ON v.idclient = c.idclient
-                     LEFT JOIN user.user u ON v.emp = u.iduser'''
-            conditions = []
-            params = []
-            if date_from:
-                conditions.append("v.datv >= %s")
-                params.append(date_from)
-            if date_to:
-                conditions.append("v.datv <= %s")
-                params.append(date_to)
-            if vendeur:
-                conditions.append("u.np LIKE %s")
-                params.append(f"%{vendeur}%")
-            if client:
-                conditions.append("c.np LIKE %s")
-                params.append(f"%{client}%")
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-            sql += " ORDER BY v.datv DESC"
-            cursor.execute(sql, params)
-            sales = cursor.fetchall()
-        conn.close()
-        def to_str(val):
-            return str(val) if val is not None else ''
-        if sales:
-            sales_data = [
-                {
-                    'id': to_str(row[0]),  # nov
-                    'date': to_str(row[1]),  # datv
-                    'client': to_str(row[2]),  # client_name
-                    'vendeur': to_str(row[3]),  # vendeur_name
-                    'montant': to_str(row[4])  # verse
-                } for row in sales
-            ]
-            sio.emit('sales_data', {'sales': sales_data})
+    # Find and remove the matching pending request
+    reqs = pending_requests.get(client_sid, [])
+    if isinstance(reqs, list):
+        for i, req in enumerate(reqs):
+            if req.get('type') == 'get_treasury':
+                del reqs[i]
+                break
+        if not reqs:
+            pending_requests.pop(client_sid, None)
         else:
-            sio.emit('sales_data', {'sales': []})
-    except Exception as e:
-        sio.emit('sales_data', {'error': str(e)})
+            pending_requests[client_sid] = reqs
+    # Relay result to client
+    socketio.emit('treasury_data', data, room=client_sid)
 
-@sio.on('get_sale_details')
-def on_get_sale_details(data):
-    # Get sale details for a specific sale
-    sale_id = data.get('sale_id')
-    try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            # Select product name, quantity, and product price (ppa)
-            sql = '''SELECT p.nom as produit, vx.qt, vx.ppa
-                     FROM ventex vx
-                     LEFT JOIN prod p ON vx.nop = p.nop
-                     WHERE vx.nov = %s'''
-            cursor.execute(sql, (sale_id,))
-            details = cursor.fetchall()
-        conn.close()
-        def to_str(val, is_price=False):
-            if val is None:
-                return ''
-            try:
-                f = float(val)
-                return f"{f:.2f}" if is_price else str(val)
-            except Exception:
-                return str(val)
-        if details:
-            sio.emit('sale_details_data', {'details': [
-                {
-                    'produit': to_str(row[0]),  # produit name
-                    'qtt': to_str(row[1]),      # qt
-                    'pv': to_str(row[2], True)  # ppa (product price)
-                } for row in details
-            ]})
-        else:
-            sio.emit('sale_details_data', {'details': []})
-    except Exception as e:
-        sio.emit('sale_details_data', {'error': str(e)})
+# --- FOURNISSEURS RELAY ---
+@socketio.on('get_fournisseurs')
+def handle_get_fournisseurs(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('fournisseurs_data', {'error': 'Not registered for a store'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('fournisseurs_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    pending_requests[client_sid].append({'type': 'fournisseurs', 'store_code': store_code})
+    socketio.emit('get_fournisseurs', data, room=store_sid)
 
-@sio.on('get_vendeurs')
-def on_get_vendeurs(data):
-    # Get list of vendeurs (users)
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            # First, let's check what tables exist
-            cursor.execute("SHOW TABLES")
-            tables = cursor.fetchall()
-            
-            # Check if user table exists and has data
-            cursor.execute("SELECT COUNT(*) FROM user")
-            user_count = cursor.fetchone()[0]
-            
-            sql = "SELECT np FROM user ORDER BY np"
-            cursor.execute(sql)
-            rows = cursor.fetchall()
-        conn.close()
-        
-        vendeurs = [row[0] for row in rows if row[0]]
-        sio.emit('vendeurs_data', {'vendeurs': vendeurs})
-    except Exception as e:
-        sio.emit('vendeurs_data', {'error': str(e)})
-
-@sio.on('get_clients_list')
-def on_get_clients_list(data):
-    # Get list of clients for dropdown
-    try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            # First, let's check what tables exist
-            cursor.execute("SHOW TABLES")
-            tables = cursor.fetchall()
-            
-            # Check if clients table exists and has data
-            cursor.execute("SELECT COUNT(*) FROM clients")
-            clients_count = cursor.fetchone()[0]
-            
-            sql = "SELECT np FROM clients ORDER BY np"
-            cursor.execute(sql)
-            rows = cursor.fetchall()
-        conn.close()
-        
-        clients = [row[0] for row in rows if row[0]]
-        sio.emit('clients_list_data', {'clients': clients})
-    except Exception as e:
-        sio.emit('clients_list_data', {'error': str(e)})
-
-@sio.on('get_treasury')
-def on_get_treasury(data):
-    """
-    Receives: {'date_from': 'YYYY-MM-DD', 'date_to': 'YYYY-MM-DD', 'client_sid': ...}
-    Responds: {'client_sid': ..., 'success': True/False, 'error': ..., 'data': {...}}
-    """
-    client_sid = data.get('client_sid')
-    date_from = data.get('date_from')
-    date_to = data.get('date_to')
-    print(f"[DEBUG] get_treasury: date_from={date_from}, date_to={date_to}")
-    result = {'client_sid': client_sid, 'success': False, 'error': None, 'data': {}}
-    try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            # Build query to sum all relevant columns in rj for the date range
-            sql = '''SELECT 
-                COALESCE(SUM(mesv),0), COALESCE(SUM(mesm),0),
-                COALESCE(SUM(mhsv),0), COALESCE(SUM(mhsm),0),
-                COALESCE(SUM(remisag),0), COALESCE(SUM(caisse),0),
-                COALESCE(SUM(vers),0), COALESCE(SUM(dette),0),
-                COALESCE(SUM(shp),0), COALESCE(SUM(trem),0),
-                COALESCE(SUM(benefice),0), COALESCE(SUM(deps),0),
-                COALESCE(SUM(perim),0), COALESCE(SUM(pfourn),0)
-                FROM rj WHERE date >= %s AND date <= %s'''
-            print(f"[DEBUG] get_treasury SQL: {sql}")
-            cursor.execute(sql, (date_from, date_to))
-            row = cursor.fetchone()
-            print(f"[DEBUG] get_treasury row: {row}")
-        conn.close()
-        # Map results
-        (mesv, mesm, mhsv, mhsm, remisag, caisse, vers, dette, shp, trem, benefice, deps, perim, pfourn) = row
-        # Calculated fields
-        total_ventes_ca = (mesv or 0) + (mhsv or 0)
-        total_ventes_marge = (mesm or 0) + (mhsm or 0)
-        total_depenses = (deps or 0) + (perim or 0)
-        remise_marge = -(remisag or 0)
-        benefice_net = (benefice or 0) - total_depenses
-        # Prepare data dict
-        def to_str(val):
-            if val is None:
-                return '0.00'
-            try:
-                return f"{float(val):.2f}"
-            except Exception:
-                return str(val)
-        treasury = {
-            'mesv': to_str(mesv),
-            'mesm': to_str(mesm),
-            'mhsv': to_str(mhsv),
-            'mhsm': to_str(mhsm),
-            'total_ventes_ca': to_str(total_ventes_ca),
-            'total_ventes_marge': to_str(total_ventes_marge),
-            'remisag': to_str(remisag),
-            'remise_marge': to_str(remise_marge),
-            'caisse': to_str(caisse),
-            'vers': to_str(vers),
-            'dette': to_str(dette),
-            'shp': to_str(shp),
-            'trem': to_str(trem),
-            'benefice': to_str(benefice),
-            'deps': to_str(deps),
-            'perim': to_str(perim),
-            'total_depenses': to_str(total_depenses),
-            'pfourn': to_str(pfourn),
-            'benefice_net': to_str(benefice_net),
-        }
-        print(f"[DEBUG] get_treasury treasury dict: {treasury}")
-        result['success'] = True
-        result['data'] = treasury
-    except Exception as e:
-        result['error'] = str(e)
-    sio.emit('treasury_data', result)
-
-# --- FOURNISSEURS HANDLER ---
-@sio.on('get_fournisseurs')
-def on_get_fournisseurs(data):
-    try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            sql = "SELECT nfourn, fourn FROM fourn ORDER BY fourn"
-            cursor.execute(sql)
-            rows = cursor.fetchall()
-        conn.close()
-        fournisseurs = [{'nfourn': str(row[0]), 'fourn': str(row[1])} for row in rows]
-        sio.emit('fournisseurs_data', {'fournisseurs': fournisseurs})
-    except Exception as e:
-        sio.emit('fournisseurs_data', {'error': str(e)})
-
-# --- FACTURES ACHAT HANDLER ---
-@sio.on('get_factures_achat')
-def on_get_factures_achat(data):
-    try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            sql = '''SELECT f.nof, f.datf, fr.fourn, f.tht, f.ttva, f.trem, f.netttc
-                     FROM fact f
-                     LEFT JOIN fourn fr ON f.nfourn = fr.nfourn
-                     ORDER BY f.datf DESC LIMIT 100'''
-            cursor.execute(sql)
-            rows = cursor.fetchall()
-        conn.close()
-        factures = [
-            {
-                'nof': str(row[0]),
-                'datf': str(row[1]),
-                'fournisseur': str(row[2]),
-                'tht': str(row[3]),
-                'ttva': str(row[4]),
-                'trem': str(row[5]),
-                'netttc': str(row[6])
-            } for row in rows
-        ]
-        sio.emit('factures_achat_data', {'factures': factures})
-    except Exception as e:
-        sio.emit('factures_achat_data', {'error': str(e)})
-
-# --- FACTURE ACHAT DETAILS HANDLER ---
-@sio.on('get_facture_achat_details')
-def on_get_facture_achat_details(data):
-    nof = data.get('facture_id')
-    try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            # Get facture main info
-            sql = '''SELECT f.datf, fr.fourn, f.tht, f.ttva, f.trem, f.netttc
-                     FROM fact f
-                     LEFT JOIN fourn fr ON f.nfourn = fr.nfourn
-                     WHERE f.nof = %s LIMIT 1'''
-            cursor.execute(sql, (nof,))
-            row = cursor.fetchone()
-            if not row:
-                sio.emit('facture_achat_details_data', {'details': {}})
+@socketio.on('fournisseurs_data')
+def handle_fournisseurs_data(data):
+    update_activity_for_session()
+    for client_sid, reqs in list(pending_requests.items()):
+        for i, req in enumerate(reqs):
+            if req['type'] == 'fournisseurs':
+                socketio.emit('fournisseurs_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
                 return
-            details = {
-                'datf': str(row[0]),
-                'fournisseur': str(row[1]),
-                'tht': str(row[2]),
-                'ttva': str(row[3]),
-                'trem': str(row[4]),
-                'netttc': str(row[5]),
-                'products': []
-            }
-            # Get products for this facture
-            sql_prod = '''SELECT p.nom, fx.qt, fx.pacha, fx.pvente
-                          FROM factx fx
-                          LEFT JOIN prod p ON fx.nop = p.nop
-                          WHERE fx.nof = %s'''
-            cursor.execute(sql_prod, (nof,))
-            prod_rows = cursor.fetchall()
-            def fmt_price(val):
-                try:
-                    return f"{float(val):.2f}"
-                except Exception:
-                    return str(val) if val is not None else "0.00"
 
-            details['products'] = [
-                {
-                    'produit': str(prod[0]),
-                    'qte': str(prod[1]),
-                    'pacha': fmt_price(prod[2]),
-                    'pv': fmt_price(prod[3])
-                } for prod in prod_rows
-            ]
-        conn.close()
-        sio.emit('facture_achat_details_data', {'details': details})
-    except Exception as e:
-        sio.emit('facture_achat_details_data', {'error': str(e)})
-
-@sio.on('get_factures_vente')
-def on_get_factures_vente(data):
-    print(f"Windows Backend: get_factures_vente called with data: {data}")
-    # Get sales invoices with filters
-    date_from = data.get('date_from')
-    date_to = data.get('date_to')
-    client_id = data.get('client_id')
-    
-    try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            # Build the query with correct table joins
-            sql = '''SELECT f.idfactv, f.date, c.np as client_name, f.tht, f.ttva, f.tremise, f.tttc
-                     FROM factv f
-                     LEFT JOIN clients c ON f.idclient = c.idclient'''
-            conditions = []
-            params = []
-            if date_from:
-                conditions.append("f.date >= %s")
-                params.append(date_from)
-            if date_to:
-                conditions.append("f.date <= %s")
-                params.append(date_to)
-            if client_id:
-                conditions.append("f.idclient = %s")
-                params.append(client_id)
-            
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-            
-            sql += " ORDER BY f.date DESC"
-            print(f"Windows Backend: Executing SQL: {sql} with params: {params}")
-            cursor.execute(sql, params)
-            factures = cursor.fetchall()
-            print(f"Windows Backend: Found {len(factures)} factures")
-        conn.close()
-        
-        def to_str(val):
-            return str(val) if val is not None else ''
-        
-        response_data = {'factures': [
-            {
-                'idfactv': to_str(row[0]),
-                'date': to_str(row[1]),
-                'client_name': to_str(row[2]),
-                'tht': to_str(row[3]),
-                'ttva': to_str(row[4]),
-                'tremise': to_str(row[5]),
-                'tttc': to_str(row[6])
-            } for row in factures
-        ]}
-        print(f"Windows Backend: Sending response: {response_data}")
-        sio.emit('factures_vente_data', response_data)
-    except Exception as e:
-        print(f"Windows Backend: Error in get_factures_vente: {e}")
-        sio.emit('factures_vente_data', {'error': str(e)})
-
-@sio.on('get_facture_vente_details')
-def on_get_facture_vente_details(data):
-    print(f"Windows Backend: get_facture_vente_details called with data: {data}")
-    facture_id = data.get('facture_id')
-    
-    if not facture_id:
-        print("Windows Backend: No facture_id provided")
-        sio.emit('facture_vente_details_data', {'error': 'No facture_id provided'})
+# --- FACTURES ACHAT RELAY ---
+@socketio.on('get_factures_achat')
+def handle_get_factures_achat(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('factures_achat_data', {'error': 'Not registered for a store'})
         return
-    
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('factures_achat_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    pending_requests[client_sid].append({'type': 'factures_achat', 'store_code': store_code})
+    socketio.emit('get_factures_achat', data, room=store_sid)
+
+@socketio.on('factures_achat_data')
+def handle_factures_achat_data(data):
+    update_activity_for_session()
+    for client_sid, reqs in list(pending_requests.items()):
+        for i, req in enumerate(reqs):
+            if req['type'] == 'factures_achat':
+                socketio.emit('factures_achat_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
+
+# --- FACTURE ACHAT DETAILS RELAY ---
+@socketio.on('get_facture_achat_details')
+def handle_get_facture_achat_details(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('facture_achat_details_data', {'error': 'Not registered for a store'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('facture_achat_details_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    pending_requests[client_sid].append({'type': 'facture_achat_details', 'store_code': store_code})
+    socketio.emit('get_facture_achat_details', data, room=store_sid)
+
+@socketio.on('facture_achat_details_data')
+def handle_facture_achat_details_data(data):
+    update_activity_for_session()
+    for client_sid, reqs in list(pending_requests.items()):
+        for i, req in enumerate(reqs):
+            if req['type'] == 'facture_achat_details':
+                socketio.emit('facture_achat_details_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
+
+@socketio.on('get_factures_vente')
+def handle_get_factures_vente(data):
+    print(f"API Backend: get_factures_vente called with data: {data}")
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        print("API Backend: No store code found")
+        emit('factures_vente_data', {'error': 'Not registered for a store'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        print("API Backend: Store backend not connected")
+        emit('factures_vente_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'factures_vente', 'store_code': store_code})
+    print(f'API Backend: pending_requests after get_factures_vente: {pending_requests}')
+    print(f"API Backend: Emitting to store_sid: {store_sid}")
+    socketio.emit('get_factures_vente', data, room=store_sid)
+
+@socketio.on('factures_vente_data')
+def handle_factures_vente_data(data):
+    update_activity_for_session()
+    print(f'API Backend: factures_vente_data received: {data}')
+    for client_sid, reqs in list(pending_requests.items()):
+        if not isinstance(reqs, list):
+            print(f"WARNING: pending_requests[{client_sid}] is not a list, skipping: {reqs}")
+            continue
+        for i, req in enumerate(reqs):
+            if req['type'] == 'factures_vente':
+                print(f'API Backend: relaying factures_vente_data to client_sid={client_sid}')
+                socketio.emit('factures_vente_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
+
+@socketio.on('get_facture_vente_details')
+def handle_get_facture_vente_details(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    facture_id = data.get('facture_id')
+    if not store_code or not facture_id:
+        emit('facture_vente_details_data', {'error': 'Missing store or facture ID'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('facture_vente_details_data', {'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'facture_vente_details', 'store_code': store_code, 'facture_id': facture_id})
+    print(f'API: pending_requests after get_facture_vente_details: {pending_requests}')
+    socketio.emit('get_facture_vente_details', {'facture_id': facture_id}, room=store_sid)
+
+@socketio.on('facture_vente_details_data')
+def handle_facture_vente_details_data(data):
+    update_activity_for_session()
+    print(f'API: facture_vente_details_data received, pending_requests={pending_requests}')
+    for client_sid, reqs in list(pending_requests.items()):
+        if not isinstance(reqs, list):
+            print(f"WARNING: pending_requests[{client_sid}] is not a list, skipping: {reqs}")
+            continue
+        for i, req in enumerate(reqs):
+            if req['type'] == 'facture_vente_details':
+                print(f'API: relaying facture_vente_details_data to client_sid={client_sid}')
+                socketio.emit('facture_vente_details_data', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
+
+@socketio.on('get_stoc_entries')
+def handle_get_stoc_entries(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('stoc_entries_data', {'error': 'Not registered for a store', 'entries': [], 'client_sid': client_sid})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('stoc_entries_data', {'error': 'Store backend not connected', 'entries': [], 'client_sid': client_sid})
+        return
     try:
-        conn = get_stockio_connection()
-        with conn.cursor() as cursor:
-            # Query facture details from factvx table
-            sql = '''SELECT fx.idfactvx, fx.idfactv, fx.nop, fx.produit, fx.q, fx.prix, fx.total, fx.remise
-                     FROM factvx fx
-                     WHERE fx.idfactv = %s'''
-            print(f"Windows Backend: Executing SQL: {sql} with facture_id: {facture_id}")
-            cursor.execute(sql, (facture_id,))
-            details = cursor.fetchall()
-            print(f"Windows Backend: Found {len(details)} detail rows")
+        term = (data or {}).get('term') if isinstance(data, dict) else None
+    except Exception:
+        term = None
+    # Forward request to backend with client_sid for routing
+    socketio.emit('get_stoc_entries', {'term': term, 'client_sid': client_sid}, room=store_sid)
+
+@socketio.on('stoc_entries_data')
+def handle_stoc_entries_data(data):
+    # Relay back to the originating client if provided
+    client_sid = (data or {}).get('client_sid')
+    payload = data or {}
+    if client_sid:
+        socketio.emit('stoc_entries_data', payload, room=client_sid)
+    else:
+        # Fallback: broadcast to all clients in the store room
+        try:
+            sid = request.sid
+            for sc, ss in store_sessions.items():
+                if ss == sid:
+                    socketio.emit('stoc_entries_data', payload, room=sc)
+                    break
+        except Exception:
+            pass
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    # INSTANT detection of disconnect - Socket.IO tells us immediately when connection is lost
+    sid = request.sid
+    for store_code, store_sid in list(store_sessions.items()):
+        if store_sid == sid:
+            try:
+                del store_sessions[store_code]
+                if store_code in store_last_activity:
+                    del store_last_activity[store_code]
+                # INSTANT update to OFFLINE - no timeout needed
+                try:
+                    conn = get_api_db_connection()
+                    with conn.cursor() as cursor:
+                        sql = "UPDATE stores SET status='OFFLINE' WHERE store_code=%s"
+                        cursor.execute(sql, (store_code,))
+                        conn.commit()
+                    conn.close()
+                    print(f"Store {store_code} disconnected - status set to OFFLINE instantly")
+                except Exception as e:
+                    print(f"Error updating store status to OFFLINE: {e}")
+            except Exception as e:
+                print(f"Error removing store session for {store_code}: {e}")
+    if sid in client_sessions:
+        print(f"Client disconnected from store: {client_sessions[sid]}")
+        del client_sessions[sid]
+    # Clean up pending logins
+    if sid in pending_logins:
+        del pending_logins[sid]
+    # Clean up pending stock requests
+    if sid in pending_requests:
+        del pending_requests[sid]
+
+@socketio.on('test_event')
+def handle_test_event(data):
+    print('Received test_event:', data)
+    emit('test_response', {'message': 'Test event received', 'data': data})
+
+@socketio.on('heartbeat')
+def handle_heartbeat(data):
+    """Handle heartbeat from backend to update activity tracking"""
+    update_activity_for_session()
+
+# Track last activity time for each store (any event from backend)
+store_last_activity = {}  # store_code: timestamp
+
+def update_store_activity(store_code):
+    """Update last activity timestamp for a store"""
+    if store_code:
+        store_last_activity[store_code] = time.time()
+
+def update_activity_for_session():
+    """Update activity for any backend session - called before processing any backend event"""
+    sid = request.sid
+    for store_code, store_sid in store_sessions.items():
+        if store_sid == sid:
+            update_store_activity(store_code)
+            break
+
+def check_store_connections():
+    """Periodically check if store sessions are still alive and update database status"""
+    while True:
+        gevent.sleep(10)  # Check every 10 seconds
+        try:
+            current_time = time.time()
+            stores_to_check = list(store_sessions.keys())
             
-            # Debug: Print first few rows to see the data structure
-            if details:
-                print(f"Windows Backend: First detail row: {details[0]}")
-        conn.close()
-        
-        def to_str(val):
-            return str(val) if val is not None else ''
-        
-        response_data = {'details': [
-            {
-                'idfactvx': to_str(row[0]),
-                'idfactv': to_str(row[1]),
-                'nop': to_str(row[2]),
-                'produit': to_str(row[3]),
-                'qte': to_str(row[4]),
-                'prix': to_str(row[5]),
-                'total': to_str(row[6]),
-                'remise': to_str(row[7])
-            } for row in details
-        ]}
-        print(f"Windows Backend: Sending details response: {response_data}")
-        sio.emit('facture_vente_details_data', response_data)
-    except Exception as e:
-        print(f"Windows Backend: Error in get_facture_vente_details: {e}")
-        import traceback
-        traceback.print_exc()
-        sio.emit('facture_vente_details_data', {'error': str(e)})
+            for store_code in stores_to_check:
+                store_sid = store_sessions.get(store_code)
+                if not store_sid:
+                    continue
+                
+                    # Use activity timeout as backup - Socket.IO disconnect event handles instant detection
+                    # Check every 10 seconds, timeout after 60 seconds of no activity
+                    last_activity = store_last_activity.get(store_code, 0)
+                    if last_activity == 0:
+                        # Store just registered, initialize with current time
+                        store_last_activity[store_code] = current_time
+                        continue
+                    
+                    time_since_activity = current_time - last_activity
+                    
+                    # 60 seconds timeout - if no activity for 60s, mark offline
+                    # Heartbeats every 5s should keep this updated, so 60s means truly dead
+                    if time_since_activity > 60:
+                        # Double-check: only mark offline if store_sid still exists (session might have been cleaned up)
+                        if store_code in store_sessions and store_sessions[store_code] == store_sid:
+                            print(f"Store {store_code} has no activity in {time_since_activity:.1f} seconds, marking as offline")
+                            if store_code in store_sessions:
+                                del store_sessions[store_code]
+                            if store_code in store_last_activity:
+                                del store_last_activity[store_code]
+                            try:
+                                conn = get_api_db_connection()
+                                with conn.cursor() as cursor:
+                                    sql = "UPDATE stores SET status='OFFLINE' WHERE store_code=%s"
+                                    cursor.execute(sql, (store_code,))
+                                    conn.commit()
+                                conn.close()
+                            except Exception as db_error:
+                                print(f"Error updating store status to OFFLINE: {db_error}")
+        except Exception as e:
+            print(f"Error in store connection check: {e}")
+
+# Start background task to check store connections
+gevent.spawn(check_store_connections)
 
 if __name__ == '__main__':
-    # Outer loop for infinite retries with exponential backoff when API is offline
-    backoff = 2
-    while True:
-        try:
-            print(f"Connecting to API at {API_URL} using long-polling ...")
-            sio.connect(API_URL, transports=['polling'], wait_timeout=60, socketio_path='/socket.io')
-            backoff = 2  # reset after successful connect
-            sio.wait()   # block here; internal reconnect keeps trying after disconnect
-        except KeyboardInterrupt:
-            print('Shutting down by user request')
-            try:
-                sio.disconnect()
-            except Exception:
-                pass
-            break
-        except Exception as e:
-            print(f"[BACKEND] Connection failed: {e}. Retrying in {backoff}s ...")
-            try:
-                sio.disconnect()
-            except Exception:
-                pass
-            try:
-                time.sleep(backoff)
-            except KeyboardInterrupt:
-                print('Shutting down by user request')
-                break
-            backoff = min(backoff * 2, 60)
-            continue
+    socketio.run(app, host='0.0.0.0', port=5000) 
