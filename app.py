@@ -818,6 +818,40 @@ def handle_stoc_entries_data(data):
         except Exception:
             pass
 
+@socketio.on('save_vente')
+def handle_save_vente(data):
+    client_sid = request.sid
+    store_code = client_sessions.get(client_sid)
+    if not store_code:
+        emit('save_vente_response', {'success': False, 'error': 'Not registered for a store'})
+        return
+    store_sid = store_sessions.get(store_code)
+    if not store_sid:
+        emit('save_vente_response', {'success': False, 'error': 'Store backend not connected'})
+        return
+    if client_sid not in pending_requests:
+        pending_requests[client_sid] = []
+    if isinstance(pending_requests[client_sid], dict):
+        pending_requests[client_sid] = [pending_requests[client_sid]]
+    pending_requests[client_sid].append({'type': 'save_vente', 'store_code': store_code})
+    socketio.emit('save_vente', data, room=store_sid)
+
+@socketio.on('save_vente_response')
+def handle_save_vente_response(data):
+    update_activity_for_session()
+    print(f'API: save_vente_response received, pending_requests={pending_requests}')
+    for client_sid, reqs in list(pending_requests.items()):
+        if not isinstance(reqs, list):
+            continue
+        for i, req in enumerate(reqs):
+            if req['type'] == 'save_vente':
+                print(f'API: relaying save_vente_response to client_sid={client_sid}')
+                socketio.emit('save_vente_response', data, room=client_sid)
+                del pending_requests[client_sid][i]
+                if not pending_requests[client_sid]:
+                    del pending_requests[client_sid]
+                return
+
 @socketio.on('disconnect')
 def handle_disconnect():
     # INSTANT detection of disconnect - Socket.IO tells us immediately when connection is lost
